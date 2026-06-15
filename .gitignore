@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+backend/node_modules/
+
+# Build outputs
+dist/
+frontend/dist/
+backend/dist/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+backend/certs/
+storage/keys/
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+
+# Runtime data
+storage/db/
+storage/logs/
+storage/importacoes/
+storage/remote-edi/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Tool/runtime caches
+.git-local/
+.agents/
+.codex/
+coverage/
+*.log
