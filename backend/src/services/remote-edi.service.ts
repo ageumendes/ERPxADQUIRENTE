@@ -1,26 +1,34 @@
+import { resolveSftpFolder, validateSftpFilename, withSftpBrowser, listSftpFolder, copySftpFile, SftpBrowserError } from './sftp-browser.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import SftpClient from 'ssh2-sftp-client';
-import { entradaDir, logsDir, remoteEdiDir } from '../database/paths.js';
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
+import { entradaDir, remoteEdiDir } from '../database/paths.js';
 import { calcularHashArquivo, validarExtensao } from '../utils.js';
-import { buscarImportacaoPorHash, criarImportacao } from '../repositories/repositorio.js';
+import { buscarImportacaoPorHash, criarImportacao } from '../repositories/importacoes.repository.js';
+import { getPool } from '../database/pool.js';
 
-type ProviderKey = 'cielo' | 'sipag' | 'sicredi' | 'convcard';
-type ProcessarArquivoLocal = (importacaoId: string, caminhoArquivo: string, nomeOriginal: string) => Promise<void>;
+type ProviderKey = 'alelo' | 'cielo' | 'sipag' | 'sicredi' | 'convcard' | 'pluxee' | 'sicoob' | 'ticket' | 'vr';
+type ProcessarArquivoLocal = (importacaoId: string, caminhoArquivo: string, nomeOriginal: string) => Promise<string>;
 
 type PullOptions = {
+  alelo?: boolean;
   cielo?: boolean;
   sipag?: boolean;
   sicredi?: boolean;
   convcard?: boolean;
+  pluxee?: boolean;
+  sicoob?: boolean;
+  ticket?: boolean;
+  vr?: boolean;
   dryRun?: boolean;
   moveUnknownToError?: boolean;
 };
 
 type RemoteProviderConfig = {
   key: ProviderKey;
-  nome: 'CIELO' | 'SIPAG' | 'SICREDI' | 'CONVCARD';
+  nome: 'ALELO' | 'CIELO' | 'SIPAG' | 'SICREDI' | 'CONVCARD' | 'PLUXEE' | 'SICOOB' | 'TICKET' | 'VR';
   usuario: string;
   inDir: string;
   processedDir: string;
@@ -46,6 +54,29 @@ type ColetaProviderResultado = {
 };
 
 let isRunning = false;
+const db = getPool;
+
+function chaveCriptografia(segredoInformado?: string) {
+  const segredo = String(segredoInformado || process.env.SFTP_ENCRYPTION_KEY || '');
+  if (segredo.length < 32 || segredo.startsWith('SUBSTITUA_')) throw new Error('SFTP_ENCRYPTION_KEY deve ser configurada com um segredo real de pelo menos 32 caracteres.');
+  return createHash('sha256').update(segredo).digest();
+}
+function criptografar(valor: string) { const iv=randomBytes(12),cipher=createCipheriv('aes-256-gcm',chaveCriptografia(),iv);const data=Buffer.concat([cipher.update(valor,'utf8'),cipher.final()]);return [iv.toString('base64'),cipher.getAuthTag().toString('base64'),data.toString('base64')].join('.'); }
+function descriptografarComSegredo(valor: string, segredo?: string) { const [iv,tag,data]=valor.split('.');if(!iv||!tag||!data)throw new Error('Credencial SFTP armazenada em formato inválido.');const decipher=createDecipheriv('aes-256-gcm',chaveCriptografia(segredo),Buffer.from(iv,'base64'));decipher.setAuthTag(Buffer.from(tag,'base64'));return Buffer.concat([decipher.update(Buffer.from(data,'base64')),decipher.final()]).toString('utf8'); }
+export async function obterStatusCredencialSftp(){const row=(await db().query(`SELECT atualizado_em FROM configuracoes_segurancas WHERE chave='SFTP_PRIVATE_KEY'`)).rows[0];return {configurada:Boolean(row),atualizado_em:row?.atualizado_em||null};}
+export async function salvarCredencialSftp(privateKey:string,usuarioId?:string){if(!/-----BEGIN (?:OPENSSH |RSA |EC )?PRIVATE KEY-----/.test(privateKey))throw new Error('O arquivo selecionado não contém uma chave privada SSH válida.');await db().query(`INSERT INTO configuracoes_segurancas(chave,valor_criptografado,atualizado_em,atualizado_por) VALUES('SFTP_PRIVATE_KEY',$1,NOW(),$2) ON CONFLICT(chave) DO UPDATE SET valor_criptografado=EXCLUDED.valor_criptografado,atualizado_em=NOW(),atualizado_por=EXCLUDED.atualizado_por`,[criptografar(privateKey),usuarioId||null]);return obterStatusCredencialSftp();}
+export async function removerCredencialSftp(){await db().query(`DELETE FROM configuracoes_segurancas WHERE chave='SFTP_PRIVATE_KEY'`);}
+async function lerCredencialSftp(){
+  const row=(await db().query(`SELECT valor_criptografado FROM configuracoes_segurancas WHERE chave='SFTP_PRIVATE_KEY'`)).rows[0];
+  if(!row)return undefined;
+  try{return descriptografarComSegredo(row.valor_criptografado);}catch(error){
+    const legado=String(process.env.AUTH_SECRET||'');
+    if(legado.length<32)throw error;
+    const chave=descriptografarComSegredo(row.valor_criptografado,legado);
+    await db().query(`UPDATE configuracoes_segurancas SET valor_criptografado=$1,atualizado_em=NOW() WHERE chave='SFTP_PRIVATE_KEY'`,[criptografar(chave)]);
+    return chave;
+  }
+}
 
 function envBool(name: string, fallback = false): boolean {
   const value = process.env[name];
@@ -75,11 +106,17 @@ function providerEnv(prefix: string, fallbackUser: string, allowRegex: RegExp, k
 }
 
 function montarProviders(options: PullOptions): RemoteProviderConfig[] {
+  const extensoesEdiPermitidas = /\.(csv|txt|xls|xlsx|edi|ret|rem|json|026)$/i;
   const providers = [
+    providerEnv('ALELO', 'alelo_sftp', extensoesEdiPermitidas, 'alelo', 'ALELO'),
     providerEnv('CIELO', 'cielo_sftp', /^CIELO(03|04|16).*\.(txt|ret|edi)$/i, 'cielo', 'CIELO'),
     providerEnv('SIPAG', 'sipag_sftp', /^(SIPAG-EDI-[SPR].*|BRCDSE00-EDI-[SP].*)\.(csv|txt|json)$/i, 'sipag', 'SIPAG'),
     providerEnv('SICREDI', 'sicredi_sftp', /^EDI-[SPR]-.*\.json$/i, 'sicredi', 'SICREDI'),
     providerEnv('CONVCARD', 'convcard_sftp', /^(CONVCARD.*|.*CONVCARD.*|A0.*)\.(txt|ret|edi|csv)$/i, 'convcard', 'CONVCARD'),
+    providerEnv('PLUXEE', 'pluxee_sftp', extensoesEdiPermitidas, 'pluxee', 'PLUXEE'),
+    providerEnv('SICOOB', 'sicoob_sftp', /^sicoob_pix_(?:\d{14}_)?(?:\d{4}-\d{2}-\d{2}|reconsulta_\d{4}-\d{2}-\d{2}_a_\d{4}-\d{2}-\d{2})\.json$/i, 'sicoob', 'SICOOB'),
+    providerEnv('TICKET', 'ticket_sftp', extensoesEdiPermitidas, 'ticket', 'TICKET'),
+    providerEnv('VR', 'vr_sftp', /^VR_[A-Z0-9_-]+_\d{14}_\d{8}_\d{6}\.txt$/i, 'vr', 'VR'),
   ];
   const chaves = providers.map((provider) => provider.key);
   const recebeuFiltroExplicito = chaves.some((chave) => typeof options[chave] === 'boolean');
@@ -88,22 +125,35 @@ function montarProviders(options: PullOptions): RemoteProviderConfig[] {
 }
 
 async function logRemoteEdi(message: string): Promise<void> {
-  await fs.mkdir(logsDir, { recursive: true });
-  const line = `${new Date().toISOString()} ${message}\n`;
-  await fs.appendFile(path.join(logsDir, 'remote-edi.log'), line, 'utf8').catch(() => undefined);
+  await db().query(`INSERT INTO historico_coletas_sftp(id,provider,sucesso,resumo) VALUES($1,$2,$3,$4::jsonb)`,[randomUUID(),(message.match(/^\[([^\]]+)\]/)?.[1]||'SISTEMA'),!message.includes('erro'),JSON.stringify({mensagem:message})]).catch(()=>undefined);
+}
+
+function mensagemPublicaSftp(error: unknown) {
+  const mensagem = error instanceof Error ? error.message : String(error || '');
+  if (mensagem.includes('Fingerprint SFTP não configurada')) return mensagem;
+  if (mensagem.includes('Fingerprint SFTP inválida')) return mensagem;
+  if (mensagem === 'CREDENCIAL_SFTP_AUSENTE') return 'Credencial SFTP não configurada.';
+  return 'Falha na operação SFTP. Consulte o log do servidor.';
 }
 
 async function criarSftp(provider: RemoteProviderConfig): Promise<SftpClient> {
   const host = envString('REMOTE_EDI_HOST');
   const port = envNumber('REMOTE_EDI_PORT', 22);
-  const privateKeyPath = envString('REMOTE_EDI_PRIVATE_KEY_PATH');
   const password = envString(`REMOTE_EDI_${provider.nome}_PASSWORD`) || envString('REMOTE_EDI_PASSWORD');
+  const fingerprint = envString(`REMOTE_EDI_${provider.nome}_HOST_FINGERPRINT`) || envString('REMOTE_EDI_HOST_FINGERPRINT');
 
   if (!host) throw new Error('REMOTE_EDI_HOST não configurado.');
   if (!provider.usuario) throw new Error(`Usuário SFTP não configurado para ${provider.nome}.`);
+  if (!fingerprint) throw new Error(`Fingerprint SFTP não configurada para ${provider.nome}.`);
 
-  const privateKey = privateKeyPath ? await fs.readFile(path.resolve(privateKeyPath), 'utf8') : undefined;
-  if (!privateKey && !password) throw new Error('Configure REMOTE_EDI_PRIVATE_KEY_PATH ou uma senha REMOTE_EDI_*_PASSWORD.');
+  let fingerprintHex = fingerprint.replace(/^SHA256:/i, '').trim();
+  if (/^[A-Za-z0-9+/]+={0,2}$/.test(fingerprintHex) && !/^[a-f0-9]{64}$/i.test(fingerprintHex)) {
+    fingerprintHex = Buffer.from(fingerprintHex, 'base64').toString('hex');
+  }
+  if (!/^[a-f0-9]{64}$/i.test(fingerprintHex)) throw new Error(`Fingerprint SFTP inválida para ${provider.nome}; use SHA256 em base64 ou hexadecimal.`);
+
+  const privateKey = await lerCredencialSftp();
+  if (!privateKey && !password) throw new Error('CREDENCIAL_SFTP_AUSENTE');
 
   const client = new SftpClient(`erpxadquirente-${provider.key}`);
   await client.connect({
@@ -112,6 +162,12 @@ async function criarSftp(provider: RemoteProviderConfig): Promise<SftpClient> {
     username: provider.usuario,
     privateKey,
     password: password || undefined,
+    hostHash: 'sha256',
+    hostVerifier: (hash: string) => {
+      const recebido = Buffer.from(hash.toLowerCase(), 'utf8');
+      const esperado = Buffer.from(fingerprintHex.toLowerCase(), 'utf8');
+      return recebido.length === esperado.length && timingSafeEqual(recebido, esperado);
+    },
     readyTimeout: envNumber('REMOTE_EDI_READY_TIMEOUT_MS', 20000),
   });
   return client;
@@ -122,11 +178,27 @@ function isArquivoValido(nomeArquivo: string, provider: RemoteProviderConfig): b
   return provider.allowRegex.test(nomeArquivo);
 }
 
-async function moverRemotoSeguro(client: SftpClient, origem: string, destinoDir: string, nomeArquivo: string): Promise<void> {
+async function moverRemotoSeguro(client: SftpClient, origem: string, destinoDir: string, nomeArquivo: string, copiaLocal?: string): Promise<void> {
   if (!destinoDir) return;
-  const destino = `${destinoDir.replace(/\/$/, '')}/${nomeArquivo}`;
   await client.mkdir(destinoDir, true).catch(() => undefined);
-  await client.rename(origem, destino);
+  const base = destinoDir.replace(/\/$/, '');
+  let destino = `${base}/${nomeArquivo}`;
+  if (await client.exists(destino)) {
+    const ext = path.extname(nomeArquivo);
+    const nome = path.basename(nomeArquivo, ext);
+    destino = `${base}/${nome}-${new Date().toISOString().replace(/[:.]/g, '-')}${ext}`;
+  }
+  try {
+    await client.rename(origem, destino);
+  } catch (error) {
+    if (!copiaLocal) throw error;
+    // Alguns servidores SFTP/chroots recusam rename entre diretórios. Nesse caso,
+    // publica a cópia já baixada no destino e só então remove a origem.
+    await client.fastPut(copiaLocal, destino);
+    await client.delete(origem);
+  }
+  if (await client.exists(origem)) throw new Error(`O arquivo permaneceu no diretório de entrada: ${nomeArquivo}`);
+  if (!(await client.exists(destino))) throw new Error(`O arquivo não foi confirmado no diretório de destino: ${nomeArquivo}`);
 }
 
 async function registrarArquivoBaixado(params: {
@@ -151,7 +223,7 @@ async function registrarArquivoBaixado(params: {
   }
 
   const nomeSalvo = nomeOriginal.replace(/[^a-zA-Z0-9._ -]+/g, '_').trim().slice(0, 180) || `arquivo-${Date.now()}`;
-  const sftpEntradaDir = path.join(entradaDir, '_sftp', params.provider.key, String(Date.now()), uuidv4());
+  const sftpEntradaDir = path.join(entradaDir, '_sftp', params.provider.key, String(Date.now()), randomUUID());
   const caminhoEntrada = path.join(sftpEntradaDir, nomeSalvo);
   await fs.mkdir(sftpEntradaDir, { recursive: true });
   await fs.copyFile(caminhoLocal, caminhoEntrada);
@@ -173,13 +245,16 @@ async function registrarArquivoBaixado(params: {
     mensagem_erro: null,
   });
 
-  await processarArquivoLocal(importacao.id, caminhoEntrada, nomeOriginal);
+  const statusFinal = await processarArquivoLocal(importacao.id, caminhoEntrada, nomeOriginal);
+  if (!['PROCESSADO', 'CLASSIFICADO'].includes(statusFinal)) {
+    throw new Error(`Importação não concluída com sucesso (status ${statusFinal}).`);
+  }
   return {
     nome_arquivo: nomeOriginal,
     acao: 'BAIXADO_IMPORTADO',
     importacao_id: importacao.id,
     hash_arquivo,
-    mensagem: 'Arquivo baixado do SFTP e enviado ao classificador/importador.',
+    mensagem: `Arquivo baixado, importado com sucesso e pronto para arquivamento remoto (${statusFinal}).`,
   };
 }
 
@@ -218,24 +293,42 @@ async function coletarProvider(provider: RemoteProviderConfig, options: PullOpti
         const registro = await registrarArquivoBaixado({ provider, caminhoLocal, nomeOriginal: item.name, processarArquivoLocal });
         resultado.arquivos.push(registro);
         if (registro.acao === 'BAIXADO_IMPORTADO' || registro.acao === 'DUPLICADO') {
-          await moverRemotoSeguro(client, remoto, provider.processedDir, item.name).catch((error) => {
-            resultado.arquivos.push({ nome_arquivo: item.name, acao: 'ERRO', mensagem: `Importado, mas falhou ao mover remoto para processed: ${error instanceof Error ? error.message : String(error)}` });
+          let moveu = true;
+          await moverRemotoSeguro(client, remoto, provider.processedDir, item.name, caminhoLocal).catch(async (error) => {
+            moveu = false;
+            resultado.sucesso = false;
+            await logRemoteEdi(`[${provider.nome}] falha ao mover ${item.name} para processed: ${error instanceof Error ? error.message : String(error)}`);
+            resultado.arquivos.push({ nome_arquivo: item.name, acao: 'ERRO', mensagem: 'Arquivo importado, mas não foi possível arquivá-lo remotamente em processed.' });
           });
+          if (moveu) {
+            await fs.unlink(caminhoLocal).catch(() => undefined);
+            if (registro.hash_arquivo) {
+              const importacaoConfirmada = await buscarImportacaoPorHash(registro.hash_arquivo);
+              const caminhoImportado = String(importacaoConfirmada?.caminho_arquivo || '');
+              if (caminhoImportado) await fs.unlink(caminhoImportado).catch(() => undefined);
+            }
+          }
         }
       } catch (error) {
+        resultado.sucesso = false;
         const mensagem = error instanceof Error ? error.message : 'Erro desconhecido ao processar arquivo remoto.';
-        resultado.arquivos.push({ nome_arquivo: item.name, acao: 'ERRO', mensagem });
-        if (options.moveUnknownToError) {
-          await moverRemotoSeguro(client, remoto, provider.errorDir, item.name).catch(() => undefined);
+        await logRemoteEdi(`[${provider.nome}] erro ao processar ${item.name}: ${mensagem}`);
+        resultado.arquivos.push({ nome_arquivo: item.name, acao: 'ERRO', mensagem: 'Não foi possível importar este arquivo remoto. Consulte o log do servidor.' });
+        if (options.moveUnknownToError !== false) {
+          await moverRemotoSeguro(client, remoto, provider.errorDir, item.name, caminhoLocal).catch(() => undefined);
         }
       }
     }
 
-    await logRemoteEdi(`[${provider.nome}] coleta finalizada: ${resultado.arquivos.length} arquivo(s).`);
+    const listaFinal = await client.list(provider.inDir);
+    resultado.total_remoto = listaFinal.filter((item) => item.type === '-').length;
+    resultado.total_candidatos = listaFinal.filter((item) => item.type === '-' && isArquivoValido(item.name, provider)).length;
+    await logRemoteEdi(`[${provider.nome}] coleta finalizada: ${resultado.arquivos.length} processado(s), ${resultado.total_candidatos} candidato(s) restante(s) em ${provider.inDir}.`);
   } catch (error) {
     resultado.sucesso = false;
-    resultado.erro = error instanceof Error ? error.message : 'Erro desconhecido na coleta SFTP.';
-    await logRemoteEdi(`[${provider.nome}] erro: ${resultado.erro}`);
+    const erroTecnico = error instanceof Error ? error.message : 'Erro desconhecido na coleta SFTP.';
+    resultado.erro = mensagemPublicaSftp(error);
+    await logRemoteEdi(`[${provider.nome}] erro: ${erroTecnico}`);
   } finally {
     await client?.end().catch(() => undefined);
   }
@@ -245,7 +338,7 @@ async function coletarProvider(provider: RemoteProviderConfig, options: PullOpti
 
 export async function pingRemoteEdi(): Promise<{ sucesso: boolean; habilitado: boolean; providers: Array<{ provider: string; sucesso: boolean; mensagem: string }> }> {
   const habilitado = envBool('REMOTE_EDI_ENABLED', false);
-  const providers = montarProviders({ cielo: true, sipag: true, sicredi: true, convcard: true });
+  const providers = montarProviders({ alelo: true, cielo: true, sipag: true, sicredi: true, convcard: true, pluxee: true, sicoob: true, ticket: true, vr: true });
   const resultados = [] as Array<{ provider: string; sucesso: boolean; mensagem: string }>;
 
   if (!habilitado) {
@@ -259,7 +352,8 @@ export async function pingRemoteEdi(): Promise<{ sucesso: boolean; habilitado: b
       await client.list(provider.inDir);
       resultados.push({ provider: provider.nome, sucesso: true, mensagem: `Conexão OK em ${provider.inDir}.` });
     } catch (error) {
-      resultados.push({ provider: provider.nome, sucesso: false, mensagem: error instanceof Error ? error.message : 'Falha desconhecida.' });
+      await logRemoteEdi(`[${provider.nome}] falha no teste: ${error instanceof Error ? error.message : String(error)}`);
+      resultados.push({ provider: provider.nome, sucesso: false, mensagem: mensagemPublicaSftp(error) });
     } finally {
       await client?.end().catch(() => undefined);
     }
@@ -298,4 +392,27 @@ export async function coletarRemoteEdi(options: PullOptions, processarArquivoLoc
   } finally {
     isRunning = false;
   }
+}
+
+
+// Navegação e segunda via: não chama coleta, importador ou movimentação remota.
+export function obterPastasNavegadorSftp() {
+  return { habilitado: envBool('REMOTE_EDI_ENABLED', false), providers: montarProviders({}).map(p => ({
+    key: p.key, nome: p.nome, usuario: p.usuario,
+    pastas: [{ key: 'in', caminho: p.inDir }, { key: 'processed', caminho: p.processedDir }, { key: 'error', caminho: p.errorDir }],
+  })) };
+}
+function alvoNavegadorSftp(provider: unknown, pasta: unknown) {
+  if (!envBool('REMOTE_EDI_ENABLED', false)) throw new SftpBrowserError(400, 'SFTP desabilitado na configuração do app.');
+  return resolveSftpFolder(montarProviders({}), provider, pasta);
+}
+export async function listarArquivosSftp(provider: unknown, pasta: unknown, signal?: AbortSignal) {
+  const alvo = alvoNavegadorSftp(provider, pasta);
+  const arquivos = await withSftpBrowser(() => criarSftp(alvo.provider as RemoteProviderConfig), client => listSftpFolder(client, alvo.dir), signal);
+  return { provider: alvo.provider.key, usuario: alvo.provider.usuario, pasta: alvo.folder, caminho: alvo.dir, arquivos };
+}
+export async function baixarCopiaArquivoSftp(provider: unknown, pasta: unknown, nome: unknown, signal?: AbortSignal) {
+  const alvo = alvoNavegadorSftp(provider, pasta);
+  validateSftpFilename(nome);
+  return withSftpBrowser(() => criarSftp(alvo.provider as RemoteProviderConfig), (client, operationSignal) => copySftpFile(client, alvo.dir, nome, operationSignal), signal);
 }

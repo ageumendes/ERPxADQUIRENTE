@@ -217,21 +217,14 @@ export async function parseSicrediFiserv74(importacaoId: string, caminhoArquivo:
       vendas_adquirentes.push(vendaParcelada(importacaoId, numeroRegistro014, parcelado, menorDetalheParcela(parcelado.salesReceiptInstallmentTransaction)));
     }
   } else if (tipo_arquivo === 'P') {
-    if (data.fileHeader) pushBruto(data.fileHeader);
-    for (const item of data.clientHeaders || []) pushBruto(item);
-    const listas = [
-      'debitFinanceSummary', 'creditFinanceSummary', 'installmentFinanceSummary', 'financeSuspendedTransactions',
-      'intraCountSummary', 'financeAdjustments', 'chargebackReceipt', 'financeSummaryAdvancement',
-      'financeAdvancementFileTrailer', 'financeClientFileTrailers',
-    ];
+    // Arquivo financeiro: persistimos somente eventos/detalhes úteis. Headers,
+    // trailers e objetos explicitamente totalizadores (*Summary) não vão ao banco.
+    const listas = ['financeSuspendedTransactions', 'financeAdjustments', 'chargebackReceipt'];
     for (const lista of listas) for (const item of data[lista] || []) pushBruto(item);
-    if (data.financeFileTrailer) pushBruto(data.financeFileTrailer);
   } else {
-    if (data.fileHeader) pushBruto(data.fileHeader);
-    for (const item of data.clientHeaders || []) pushBruto(item);
-    const listas = ['receivableUnits', 'receivableUnitTrailers'];
-    for (const lista of listas) for (const item of data[lista] || []) pushBruto(item);
-    if (data.fileTrailerRU) pushBruto(data.fileTrailerRU);
+    // Recebíveis: a unidade recebível é o evento de negócio; trailers e cabeçalhos
+    // são apenas estruturas de controle do arquivo.
+    for (const item of data.receivableUnits || []) pushBruto(item);
   }
 
   return { tipo_arquivo, registros_brutos, vendas_adquirentes };

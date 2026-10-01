@@ -1,12 +1,9 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { createRequire } from 'node:module';
 import { normalizarTexto } from '../utils.js';
 import type { VendaErp } from '../repositorio.js';
-
-const require = createRequire(import.meta.url);
-const XLSX = require('xlsx');
+import { lerExcelIsolado } from '../services/excel-isolado.js';
 
 const aliases: Record<keyof Omit<VendaErp, 'id' | 'importacao_id' | 'numero_linha' | 'hash_linha' | 'dados_originais' | 'data_criacao'>, string[]> = {
   data_venda: ['DATA VENDA', 'DATA', 'SALE_DATE', 'CANON_SALE_DATE'],
@@ -39,6 +36,38 @@ function pareceNumero(valor: unknown): boolean {
   return v !== '' && !Number.isNaN(Number(v));
 }
 
+function cnpjValido(valor: string): boolean {
+  const cnpj = valor.replace(/\D/g, '');
+  if (cnpj.length !== 14 || /^(\d)\1{13}$/.test(cnpj)) return false;
+  const digito = (base: string, pesos: number[]) => {
+    const soma = base.split('').reduce((total, numero, indice) => total + Number(numero) * pesos[indice], 0);
+    const resto = soma % 11;
+    return resto < 2 ? 0 : 11 - resto;
+  };
+  const primeiro = digito(cnpj.slice(0, 12), [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]);
+  const segundo = digito(cnpj.slice(0, 12) + primeiro, [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]);
+  return cnpj.endsWith(`${primeiro}${segundo}`);
+}
+
+export function extrairEstabelecimentoInterdata(matriz: unknown[][]): { cnpj: string; razao_social: string } {
+  // Alguns relatórios trazem a LOJA/CNPJ apenas no rodapé.
+  const candidatas = [...matriz.slice(0, 30), ...matriz.slice(Math.max(30, matriz.length - 40))];
+  for (const linha of candidatas) {
+    const indiceCnpj = linha.findIndex((celula) => {
+      const digitos = texto(celula).replace(/\D/g, '');
+      return cnpjValido(digitos);
+    });
+    if (indiceCnpj < 0) continue;
+    const cnpj = texto(linha[indiceCnpj]).replace(/\D/g, '');
+    const razaoSocial = linha
+      .slice(0, indiceCnpj)
+      .map(texto)
+      .find((valor) => /[A-Za-zÀ-ÿ]{3}/.test(valor) && !/^(CNPJ|ESTABELECIMENTO)$/i.test(valor)) || '';
+    return { cnpj, razao_social: razaoSocial };
+  }
+  return { cnpj: '', razao_social: '' };
+}
+
 function ehExcelInterdataSemCabecalho(matriz: unknown[][]): boolean {
   const linhas = matriz.slice(0, 50).filter((linha) => linha.some((celula) => texto(celula).length > 0));
   if (linhas.length < 5) return false;
@@ -56,11 +85,13 @@ function ehExcelInterdataSemCabecalho(matriz: unknown[][]): boolean {
   return linhasComPadrao.length >= Math.min(5, linhas.length);
 }
 
-function linhaPosicionalInterdata(row: unknown[], importacaoId: string, numeroLinha: number, agora: string): VendaErp {
+function linhaPosicionalInterdata(row: unknown[], importacaoId: string, numeroLinha: number, agora: string, estabelecimento: { cnpj: string; razao_social: string }): VendaErp {
   const dataHora = texto(row[0]);
   const [dataVenda, horaVenda = ''] = dataHora.split(/\s+/);
   const bruto: Record<string, string> = {};
   row.forEach((cell, index) => { bruto[`COLUNA_${index + 1}`] = texto(cell); });
+  if (estabelecimento.cnpj) bruto.CNPJ_ESTABELECIMENTO_RELATORIO = estabelecimento.cnpj;
+  if (estabelecimento.razao_social) bruto.RAZAO_SOCIAL_ESTABELECIMENTO = estabelecimento.razao_social;
 
   return {
     id: `${importacaoId}-erp-${numeroLinha}`,
@@ -75,13 +106,23 @@ function linhaPosicionalInterdata(row: unknown[], importacaoId: string, numeroLi
     bandeira: texto(row[8]),
     tipo_produto: texto(row[11]),
     parcelas: texto(row[16]),
-    cnpj_estabelecimento: '',
+    cnpj_estabelecimento: estabelecimento.cnpj,
     id_venda_erp: texto(row[2]),
     status_venda: texto(row[15]),
     hash_linha: hashLinha(importacaoId, numeroLinha, bruto),
     dados_originais: bruto,
     data_criacao: agora,
   };
+}
+
+export function parseMatrizPosicionalInterdata(importacaoId: string, matriz: unknown[][], agora = new Date().toISOString()): VendaErp[] | null {
+  if (!ehExcelInterdataSemCabecalho(matriz)) return null;
+  const estabelecimento = extrairEstabelecimentoInterdata(matriz);
+  return matriz
+    .map((row, index) => ({ row, numeroLinha: index + 1 }))
+    .filter(({ row }) => row.some((value) => texto(value).length > 0))
+    .filter(({ row }) => pareceDataHoraInterdata(row[0]) && pareceNumero(row[24]))
+    .map(({ row, numeroLinha }) => linhaPosicionalInterdata(row, importacaoId, numeroLinha, agora, estabelecimento));
 }
 
 function detectarSeparador(linha: string) {
@@ -118,12 +159,7 @@ function encontrarLinhaCabecalho(matriz: unknown[][]): number {
   return melhorIndice;
 }
 
-function lerLinhasExcel(caminhoArquivo: string): Record<string, string>[] {
-  const workbook = XLSX.readFile(caminhoArquivo, { cellDates: false, raw: false });
-  const sheetName = workbook.SheetNames?.[0];
-  if (!sheetName) return [];
-  const sheet = workbook.Sheets[sheetName];
-  const matriz = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false }) as unknown[][];
+function lerLinhasExcel(matriz: unknown[][]): Record<string, string>[] {
   if (matriz.length < 2) return [];
 
   const headerIndex = encontrarLinhaCabecalho(matriz);
@@ -186,8 +222,95 @@ function ehLinhaCabecalhoRepetido(row: Record<string, string>): boolean {
 }
 
 function hashLinha(importacaoId: string, numeroLinha: number, row: Record<string, string>) {
-  // Hash do conteúdo bruto. Nenhum campo importado é convertido ou alterado.
+  // Layouts legados mantêm a identidade histórica baseada no lote/linha.
   return crypto.createHash('sha256').update(JSON.stringify({ importacaoId, numeroLinha, row })).digest('hex');
+}
+
+function normalizarDataInterdata(valor: unknown): string {
+  const v = texto(valor);
+  if (!v) return '';
+  const iso = v.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) return `${iso[3]}/${iso[2]}/${iso[1]}`;
+  const br = v.match(/^(\d{2})\/(\d{2})\/(\d{4})/);
+  return br ? `${br[1]}/${br[2]}/${br[3]}` : v;
+}
+
+function normalizarHoraInterdata(valor: unknown): string {
+  const v = texto(valor);
+  const m = v.match(/(?:T|\s)(\d{2}:\d{2}(?::\d{2})?)/);
+  return m?.[1] || '';
+}
+
+function ehLayoutInterdataMovimento30Dias(matriz: unknown[][]): boolean {
+  const linha = matriz.slice(0, 10).find((r) => {
+    const n = r.map((c) => normalizarTexto(texto(c)).replace(/[^A-Z0-9/]+/g, ' ').trim()).filter(Boolean);
+    return ['BANDEIRA', 'PRCLAS', 'ESPEIE PAG', 'VLR PARCELA', 'EMISSAO', 'VENCIMENTO', 'CODIGO', 'COD VENDA', 'DATA/HORA']
+      .filter((p) => n.includes(p)).length >= 7;
+  });
+  return Boolean(linha);
+}
+
+function hashMovimento30Dias(row: Record<string, string>, cnpj: string): string {
+  // O campo Código é estável entre exportações sobrepostas do mesmo estabelecimento.
+  // A identidade NÃO usa importacaoId nem numeroLinha, portanto D-29 + hoje pode ser
+  // reimportado diariamente sem criar cópias. O fallback usa apenas conteúdo comercial.
+  const codigo = buscarValor(row, ['CÓDIGO', 'CODIGO']);
+  const identidade = codigo
+    ? { layout: 'INTERDATA_MOVIMENTO_30D', estabelecimento: cnpj, codigo }
+    : {
+        layout: 'INTERDATA_MOVIMENTO_30D', estabelecimento: cnpj,
+        emissao: buscarValor(row, ['EMISSÃO', 'EMISSAO']),
+        vencimento: buscarValor(row, ['VENCIMENTO']),
+        data_hora: buscarValor(row, ['DATA/HORA']),
+        numero_operacao: buscarValor(row, ['Nº OP', 'N OP']),
+        codigo_venda: buscarValor(row, ['CÓD. VENDA', 'COD VENDA']),
+        bandeira: buscarValor(row, ['BANDEIRA']),
+        parcelas: buscarValor(row, ['PRCLAS']),
+        especie: buscarValor(row, ['ESPEIE PAG', 'ESPECIE PAG']),
+        valor: buscarValor(row, ['VLR. PARCELA', 'VLR PARCELA']),
+        cliente: buscarValor(row, ['CÓD. CLIENTE', 'COD CLIENTE']),
+      };
+  return crypto.createHash('sha256').update(JSON.stringify(identidade)).digest('hex');
+}
+
+export function parseMatrizMovimento30Dias(importacaoId: string, matriz: unknown[][], agora: string): VendaErp[] | null {
+  if (!ehLayoutInterdataMovimento30Dias(matriz)) return null;
+  const estabelecimento = extrairEstabelecimentoInterdata(matriz);
+  if (!estabelecimento.cnpj) {
+    throw new Error('Layout ERP de movimento identificado, mas o CNPJ/LOJA do rodapé não foi encontrado. Importação bloqueada para evitar atribuição à loja errada.');
+  }
+  const linhas = lerLinhasExcel(matriz);
+  return linhas
+    .map((row, index) => ({ row, numeroLinha: index + 2 }))
+    .filter(({ row }) => !ehLinhaCabecalhoRepetido(row))
+    .filter(({ row }) => Boolean(buscarValor(row, ['CÓDIGO', 'CODIGO'])) && Boolean(buscarValor(row, ['VLR. PARCELA', 'VLR PARCELA'])))
+    .map(({ row, numeroLinha }) => {
+      const dataHora = buscarValor(row, ['DATA/HORA']);
+      const emissao = buscarValor(row, ['EMISSÃO', 'EMISSAO']);
+      const codigo = buscarValor(row, ['CÓDIGO', 'CODIGO']);
+      const originais = {
+        ...row,
+        CNPJ_ESTABELECIMENTO_RELATORIO: estabelecimento.cnpj,
+        RAZAO_SOCIAL_ESTABELECIMENTO: estabelecimento.razao_social,
+        CODIGO_REGISTRO_ERP: codigo,
+        LAYOUT_ERP: 'INTERDATA_MOVIMENTO_30D',
+      };
+      return {
+        id: `${importacaoId}-erp-${numeroLinha}`, importacao_id: importacaoId, numero_linha: numeroLinha,
+        data_venda: normalizarDataInterdata(dataHora || emissao),
+        hora_venda: normalizarHoraInterdata(dataHora),
+        terminal: '', nsu: buscarValor(row, ['Nº OP', 'N OP']),
+        valor_bruto: buscarValor(row, ['VLR. PARCELA', 'VLR PARCELA']),
+        forma_pagamento: buscarValor(row, ['ESPEIE PAG', 'ESPECIE PAG']),
+        bandeira: buscarValor(row, ['BANDEIRA']),
+        tipo_produto: buscarValor(row, ['ESPEIE PAG', 'ESPECIE PAG']),
+        parcelas: buscarValor(row, ['PRCLAS']),
+        cnpj_estabelecimento: estabelecimento.cnpj,
+        id_venda_erp: buscarValor(row, ['CÓD. VENDA', 'COD VENDA']),
+        status_venda: '', hash_linha: hashMovimento30Dias(row, estabelecimento.cnpj),
+        dados_originais: originais, data_criacao: agora,
+      } satisfies VendaErp;
+    });
 }
 
 export async function parseLayoutInterdata(importacaoId: string, caminhoArquivo: string): Promise<VendaErp[]> {
@@ -196,20 +319,21 @@ export async function parseLayoutInterdata(importacaoId: string, caminhoArquivo:
   let linhas: Record<string, string>[] = [];
 
   if (['.xls', '.xlsx'].includes(ext)) {
-    const workbook = XLSX.readFile(caminhoArquivo, { cellDates: false, raw: false });
-    const sheetName = workbook.SheetNames?.[0];
-    const sheet = sheetName ? workbook.Sheets[sheetName] : undefined;
-    const matriz = sheet ? XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false }) as unknown[][] : [];
+    const { matriz } = await lerExcelIsolado(caminhoArquivo);
+    const estabelecimento = extrairEstabelecimentoInterdata(matriz);
+    const movimento30Dias = parseMatrizMovimento30Dias(importacaoId, matriz, agora);
+    if (movimento30Dias) return movimento30Dias;
+    const posicionais = parseMatrizPosicionalInterdata(importacaoId, matriz, agora);
+    if (posicionais) return posicionais;
 
-    if (ehExcelInterdataSemCabecalho(matriz)) {
-      return matriz
-        .map((row, index) => ({ row, numeroLinha: index + 1 }))
-        .filter(({ row }) => row.some((value) => texto(value).length > 0))
-        .filter(({ row }) => pareceDataHoraInterdata(row[0]) && pareceNumero(row[24]))
-        .map(({ row, numeroLinha }) => linhaPosicionalInterdata(row, importacaoId, numeroLinha, agora));
+    linhas = lerLinhasExcel(matriz);
+    if (estabelecimento.cnpj) {
+      linhas = linhas.map((linha) => ({
+        ...linha,
+        CNPJ_ESTABELECIMENTO_RELATORIO: estabelecimento.cnpj,
+        RAZAO_SOCIAL_ESTABELECIMENTO: estabelecimento.razao_social,
+      }));
     }
-
-    linhas = lerLinhasExcel(caminhoArquivo);
   } else {
     const conteudo = await fs.readFile(caminhoArquivo, 'latin1');
     linhas = parseTextoTabular(conteudo);
@@ -233,7 +357,7 @@ export async function parseLayoutInterdata(importacaoId: string, caminhoArquivo:
         bandeira: buscarValor(row, aliases.bandeira),
         tipo_produto: buscarValor(row, aliases.tipo_produto),
         parcelas: buscarValor(row, aliases.parcelas),
-        cnpj_estabelecimento: buscarValor(row, aliases.cnpj_estabelecimento),
+        cnpj_estabelecimento: buscarValor(row, ['CNPJ_ESTABELECIMENTO_RELATORIO', ...aliases.cnpj_estabelecimento]),
         id_venda_erp: buscarValor(row, aliases.id_venda_erp),
         status_venda: buscarValor(row, aliases.status_venda),
         hash_linha: hashLinha(importacaoId, numeroLinha, row),

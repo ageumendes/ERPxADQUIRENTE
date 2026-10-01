@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { entradaDir, erroDir, desconhecidosDir, processandoDir, processadosDir, dbDir, logsDir, remoteEdiDir, keysDir } from './paths.js';
+import { entradaDir, erroDir, desconhecidosDir, processandoDir, processadosDir, logsDir, remoteEdiDir, keysDir } from './paths.js';
 import { EXTENSOES_BLOQUEADAS, EXTENSOES_PERMITIDAS } from './types.js';
 
 export async function garantirPastas(): Promise<void> {
@@ -16,13 +16,17 @@ export async function garantirPastas(): Promise<void> {
     path.join(erroDir, 'falha_importacao'),
     path.join(erroDir, 'extensao_bloqueada'),
     desconhecidosDir,
-    dbDir,
     logsDir,
     keysDir,
     path.join(remoteEdiDir, 'cielo', 'pulled'),
     path.join(remoteEdiDir, 'sipag', 'pulled'),
     path.join(remoteEdiDir, 'sicredi', 'pulled'),
     path.join(remoteEdiDir, 'convcard', 'pulled'),
+    path.join(remoteEdiDir, 'alelo', 'pulled'),
+    path.join(remoteEdiDir, 'pluxee', 'pulled'),
+    path.join(remoteEdiDir, 'sicoob', 'pulled'),
+    path.join(remoteEdiDir, 'ticket', 'pulled'),
+    path.join(remoteEdiDir, 'vr', 'pulled'),
   ].map((dir) => fsp.mkdir(dir, { recursive: true })));
 }
 

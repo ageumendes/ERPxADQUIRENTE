@@ -250,13 +250,7 @@ function hashLinha(importacaoId: string, tipoArquivo: string, numeroLinha: numbe
   return crypto.createHash('sha256').update(JSON.stringify({ importacaoId, tipoArquivo, numeroLinha, linhaOriginal })).digest('hex');
 }
 
-type DetalheParcela014 = { nsu: string; numeroParcela: string; totalParcelas: string; dataCredito: string; valorLiquidoParcela: string; valorLiquidoCompra: string };
-
-function parcelaAtual(valor: string): number {
-  const match = texto(valor).match(/^(\d+)\/(\d+)$/);
-  if (!match) return 999999;
-  return Number(match[1]);
-}
+type DetalheParcela014 = { taxa: string; rrn: string; nsu: string; numeroParcela: string; totalParcelas: string; dataCredito: string; valorLiquidoParcela: string; valorLiquidoCompra: string };
 
 function totalParcelasDoResumo(valor: string): string {
   const match = texto(valor).match(/^(\d+)\/(\d+)$/);
@@ -271,6 +265,7 @@ function chaveParcelado014(cells: string[]): string {
     texto(cells[4]), // numero_resumo_venda
     texto(cells[10]), // numero_cartao
     texto(cells[11]), // codigo_autorizacao
+    texto(cells[12]), // hora
     texto(cells[13]), // terminal
     texto(cells[16]), // valor_bruto
   ].join('|');
@@ -320,7 +315,7 @@ function vendaCanonicaS(
   cells: string[],
   dados_json: Record<string, string>,
   hash_linha: string,
-  detalhesParcelasPorResumo: Map<string, DetalheParcela014>,
+  detalhesParcelasPorResumo: Map<string, DetalheParcela014[]>,
   parceladosJaIncluidos: Set<string>,
 ): VendaAdquirente | null {
   const codigo = texto(cells[0]);
@@ -337,7 +332,8 @@ function vendaCanonicaS(
     numero_linha: numeroLinha,
     hash_linha,
     linha_original: linhaOriginal,
-    dados_json,
+    codigo_estabelecimento: dados_json.codigo_cliente,
+    dados_json: { ...dados_json, codigo_estabelecimento_original: dados_json.codigo_cliente },
     data_criacao: agora,
   };
 
@@ -347,8 +343,9 @@ function vendaCanonicaS(
       data_venda: texto(cells[7]),
       hora_venda: texto(cells[8]),
       valor_bruto: texto(cells[11]),
-      nsu: texto(cells[5]),
-      terminal: texto(cells[4]),
+      nsu: texto(cells[12]),
+      terminal: texto(cells[5]),
+      dados_json: { ...base.dados_json, terminal_original: texto(cells[5]) },
       modalidade: 'PIX',
       status_transacao: texto(cells[6]),
       codigo_produto: texto(cells[12]),
@@ -381,7 +378,17 @@ function vendaCanonicaS(
     if (parceladosJaIncluidos.has(chaveVenda)) return null;
     parceladosJaIncluidos.add(chaveVenda);
 
-    const detalhe = detalhesParcelasPorResumo.get(`${texto(cells[2])}|${texto(cells[3])}|${texto(cells[4])}`);
+    const detalhes = detalhesParcelasPorResumo.get(chaveVenda) || [];
+    const detalhe = detalhes[0];
+    const total = Number(totalParcelasDoResumo(texto(cells[20])) || detalhe?.totalParcelas || 1);
+    const completo = detalhes.length === total && detalhes.every((d, i) => Number(d.numeroParcela) === i + 1);
+    const centavos = (v: string) => Math.round(Number(v) * 100);
+    const liquido = completo
+      ? (detalhes.reduce((s, d) => s + centavos(d.valorLiquidoParcela), 0) / 100).toFixed(2)
+      : detalhe?.valorLiquidoCompra || undefined;
+    const taxa = completo
+      ? (detalhes.reduce((s, d) => s + centavos(d.taxa), 0) / 100).toFixed(2)
+      : liquido ? ((centavos(texto(cells[16])) - centavos(liquido)) / 100).toFixed(2) : undefined;
     const totalParcelas = totalParcelasDoResumo(texto(cells[20])) || detalhe?.totalParcelas || texto(cells[20]);
 
     return {
@@ -390,8 +397,10 @@ function vendaCanonicaS(
       hora_venda: texto(cells[12]),
       data_pagamento: detalhe?.dataCredito || texto(cells[19]),
       valor_bruto: texto(cells[16]),
-      valor_taxa: texto(cells[17]),
-      valor_liquido: detalhe?.valorLiquidoCompra || texto(cells[18]),
+      valor_taxa: taxa,
+      valor_liquido: liquido,
+      dados_json: { ...base.dados_json, acquirer_reference_number: detalhe?.rrn || '',
+        parcelas_completas: completo ? 'SIM' : 'NAO', detalhes_parcelas: JSON.stringify(detalhes) },
       nsu: detalhe?.nsu || '',
       codigo_autorizacao: texto(cells[11]),
       terminal: texto(cells[13]),
@@ -406,93 +415,42 @@ function vendaCanonicaS(
   return null;
 }
 
-function vendaCanonicaP(importacaoId: string, numeroLinha: number, linhaOriginal: string, cells: string[], dados_json: Record<string, string>, hash_linha: string): VendaAdquirente | null {
-  const codigo = texto(cells[0]);
-  if (codigo !== '021' && codigo !== '023' && codigo !== '025') return null;
-  const agora = new Date().toISOString();
-  return {
-    id: `${importacaoId}-sipag-p-${numeroLinha}`,
-    importacao_id: importacaoId,
-    adquirente: 'SIPAG',
-    layout_origem: 'sipag_layout_2_0_p',
-    tipo_arquivo: 'P',
-    codigo_registro: codigo,
-    numero_linha: numeroLinha,
-    data_pagamento: texto(cells[2]),
-    parcelas: texto(cells[5]) && texto(cells[6]) ? `${texto(cells[5])}/${texto(cells[6])}` : texto(cells[5]),
-    codigo_produto: texto(cells[7]),
-    bandeira: texto(cells[8]),
-    modalidade: texto(cells[12]),
-    nsu: texto(cells[13]),
-    data_venda: texto(cells[14]),
-    hora_venda: texto(cells[15]),
-    terminal: texto(cells[16]),
-    codigo_autorizacao: texto(cells[21]),
-    valor_bruto: texto(cells[23]),
-    valor_taxa: texto(cells[24]),
-    valor_liquido: texto(cells[25]),
-    status_transacao: texto(cells[22]),
-    hash_linha,
-    linha_original: linhaOriginal,
-    dados_json,
-    data_criacao: agora,
-  };
-}
-
-function vendaCanonicaR(importacaoId: string, numeroLinha: number, linhaOriginal: string, cells: string[], dados_json: Record<string, string>, hash_linha: string): VendaAdquirente | null {
-  const codigo = texto(cells[0]);
-  if (codigo !== '001') return null;
-  const agora = new Date().toISOString();
-  return {
-    id: `${importacaoId}-sipag-r-${numeroLinha}`,
-    importacao_id: importacaoId,
-    adquirente: 'SIPAG',
-    layout_origem: 'sipag_layout_2_0_r',
-    tipo_arquivo: 'R',
-    codigo_registro: codigo,
-    numero_linha: numeroLinha,
-    data_venda: texto(cells[1]),
-    data_pagamento: texto(cells[7]),
-    valor_bruto: texto(cells[8]),
-    valor_taxa: texto(cells[9]),
-    valor_liquido: texto(cells[10]),
-    modalidade: texto(cells[3]),
-    codigo_produto: texto(cells[6]),
-    status_transacao: texto(cells[3]),
-    hash_linha,
-    linha_original: linhaOriginal,
-    dados_json,
-    data_criacao: agora,
-  };
-}
-
 export async function parseSipagLayout20(importacaoId: string, caminhoArquivo: string, nomeOriginal: string): Promise<ResultadoSipagLayout20> {
   const buffer = await fs.readFile(caminhoArquivo);
   const conteudo = buffer.toString('utf8').includes('�') ? buffer.toString('latin1') : buffer.toString('utf8');
-  const linhas = conteudo.split(/\r?\n/).map((linha) => linha.trim()).filter(Boolean);
+  const linhas = conteudo.split(/\r?\n/).map((linha) => linha.replace(/\r$/, '')).filter((linha) => linha.trim().length > 0);
   const tipo_arquivo = detectarTipoArquivo(nomeOriginal, linhas);
   const registros_brutos: RegistroSipagLayout20[] = [];
   const vendas_adquirentes: VendaAdquirente[] = [];
-  const detalhesParcelasPorResumo = new Map<string, DetalheParcela014>();
+  const detalhesParcelasPorResumo = new Map<string, DetalheParcela014[]>();
   const parceladosJaIncluidos = new Set<string>();
 
   if (tipo_arquivo === 'S') {
+    let resumo: string[] | undefined;
     for (const linha of linhas) {
       const cells = splitCsvLinha(linha);
-      if (texto(cells[0]) !== '015') continue;
-      const chaveResumo = `${texto(cells[1])}|${texto(cells[2])}|${texto(cells[3])}`;
-      const detalhe: DetalheParcela014 = {
-        nsu: texto(cells[4]),
-        numeroParcela: texto(cells[11]),
-        totalParcelas: texto(cells[13]),
-        dataCredito: texto(cells[10]),
-        valorLiquidoParcela: texto(cells[8]),
-        valorLiquidoCompra: texto(cells[9]),
-      };
-      const atual = detalhesParcelasPorResumo.get(chaveResumo);
-      if (!atual || Number(detalhe.numeroParcela || '999999') < Number(atual.numeroParcela || '999999')) {
-        detalhesParcelasPorResumo.set(chaveResumo, detalhe);
+      if (cells[0] === '014') { resumo = cells; continue; }
+      if (cells[0] !== '015') { resumo = undefined; continue; }
+      if (!resumo || cells[1] !== resumo[2] || cells[2] !== resumo[3] || cells[3] !== resumo[4]) {
+        throw new Error('SIPAG 2.0: parcela 015 sem venda 014 correspondente.');
       }
+      const chave = chaveParcelado014(resumo);
+      const detalhe: DetalheParcela014 = {
+        nsu: texto(cells[4]), numeroParcela: texto(cells[11]), totalParcelas: texto(cells[13]),
+        dataCredito: texto(cells[10]), valorLiquidoParcela: texto(cells[8]),
+        valorLiquidoCompra: texto(cells[9]), taxa: texto(cells[7]), rrn: texto(cells[14]),
+      };
+      const detalhes = detalhesParcelasPorResumo.get(chave) || [];
+      const repetida = detalhes.find(d => d.numeroParcela === detalhe.numeroParcela);
+      if (repetida && JSON.stringify(repetida) !== JSON.stringify(detalhe)) {
+        throw new Error('SIPAG 2.0: dados conflitantes para a mesma parcela.');
+      }
+      if (detalhes.some(d => d.rrn !== detalhe.rrn || d.totalParcelas !== detalhe.totalParcelas)) {
+        throw new Error('SIPAG 2.0: parcelas com RRN ou total incompatível.');
+      }
+      if (!repetida) detalhes.push(detalhe);
+      detalhes.sort((a, b) => Number(a.numeroParcela) - Number(b.numeroParcela));
+      detalhesParcelasPorResumo.set(chave, detalhes);
     }
   }
 
@@ -526,7 +484,12 @@ export async function parseSipagLayout20(importacaoId: string, caminhoArquivo: s
       ? vendaCanonicaS(importacaoId, numeroLinha, linhaOriginal, cells, dados_json, hash_linha, detalhesParcelasPorResumo, parceladosJaIncluidos)
       : null;
 
-    if (venda) vendas_adquirentes.push(venda);
+    if (venda) {
+      venda.hash_linha = crypto.createHash('sha256').update(JSON.stringify({
+        layout: venda.layout_origem, campos: cells.slice(0, -1),
+      })).digest('hex');
+      vendas_adquirentes.push(venda);
+    }
   }
 
   return { tipo_arquivo, registros_brutos, vendas_adquirentes };

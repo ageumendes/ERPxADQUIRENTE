@@ -16,6 +16,11 @@ export type OrigemDetectada =
   | 'SICREDI'
   | 'CONVCARD'
   | 'SICOOB'
+  | 'VR'
+  | 'PLUXEE'
+  | 'ALELO'
+  | 'TICKET'
+  | 'COOPCERTO'
   | 'PIX_BANCO'
   | 'DESCONHECIDO';
 
@@ -25,5 +30,5 @@ export interface ResultadoClassificacao {
   quantidade_registros: number;
 }
 
-export const EXTENSOES_PERMITIDAS = new Set(['.csv', '.txt', '.xls', '.xlsx', '.edi', '.ret', '.rem', '.json']);
+export const EXTENSOES_PERMITIDAS = new Set(['.csv', '.txt', '.xls', '.xlsx', '.edi', '.ret', '.rem', '.json', '.026']);
 export const EXTENSOES_BLOQUEADAS = new Set(['.exe', '.bat', '.cmd', '.sh', '.js', '.mjs', '.cjs', '.php', '.py', '.ps1', '.jar', '.msi', '.dll']);

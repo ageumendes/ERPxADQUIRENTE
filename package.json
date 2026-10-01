@@ -1,6 +1,6 @@
 {
   "name": "erpxadquirente",
-  "version": "0.1.69",
+  "version": "0.1.241",
   "private": true,
   "description": "ERPxADQUIRENTE - Conciliação ERP INTERDATA x Adquirentes",
   "scripts": {
@@ -9,6 +9,9 @@
     "dev:frontend": "npm --prefix frontend run dev",
     "install:all": "npm install && npm --prefix frontend install && npm --prefix backend install",
     "setup": "npm run install:all && npm run preparar:pastas",
+    "build": "npm --prefix backend run build && npm --prefix frontend run build",
+    "test": "npm --prefix backend run test:compiled",
+    "test:startup": "npm --prefix backend run test:startup",
     "preparar:pastas": "node scripts/preparar-pastas.mjs",
     "db:up": "docker compose up -d postgres",
     "db:down": "docker compose down",
@@ -16,6 +19,6 @@
     "db:bootstrap:local": "bash scripts/bootstrap-postgres-local.sh"
   },
   "devDependencies": {
-    "concurrently": "^8.2.2"
+    "concurrently": "^10.0.4"
   }
 }

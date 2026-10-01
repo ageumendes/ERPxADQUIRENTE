@@ -128,18 +128,20 @@ export async function parseConvcard203(importacaoId: string, caminhoArquivo: str
     if (codigo === 'L0') loteAtual = dados;
     const hash_linha = hashLinha(importacaoId, numeroLinha, linhaOriginal);
     const agora = new Date().toISOString();
-    registros_brutos.push({
-      id: `${importacaoId}-convcard-raw-${numeroLinha}`,
-      importacao_id: importacaoId,
-      tipo_arquivo: 'CONVCARD_2_0_3',
-      codigo_registro: codigo,
-      grupo_registro: grupoRegistro(codigo),
-      numero_linha: numeroLinha,
-      linha_original: linhaOriginal,
-      hash_linha,
-      dados_json: dados,
-      data_criacao: agora,
-    });
+    if (['CV', 'CP', 'CC', 'TB'].includes(codigo)) {
+      registros_brutos.push({
+        id: `${importacaoId}-convcard-raw-${numeroLinha}`,
+        importacao_id: importacaoId,
+        tipo_arquivo: 'CONVCARD_2_0_3',
+        codigo_registro: codigo,
+        grupo_registro: grupoRegistro(codigo),
+        numero_linha: numeroLinha,
+        linha_original: linhaOriginal,
+        hash_linha,
+        dados_json: dados,
+        data_criacao: agora,
+      });
+    }
     const venda = vendaCanonica(importacaoId, numeroLinha, linhaOriginal, dados, hash_linha, loteAtual);
     if (venda) vendas_adquirentes.push(venda);
   }
