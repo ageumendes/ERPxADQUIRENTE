@@ -10,9 +10,15 @@ export function identificadorVoucher(v: unknown): string {
   if (!/^[A-Z0-9]+$/.test(s) || /^(0+|NA|NULL|UNDEFINED)$/.test(s)) return '';
   return /^\d+$/.test(s) ? s.replace(/^0+/, '') : s;
 }
-export const capturaVoucher = (v: VendaAdquirente) => capturaRedes.has(redeVoucher(v)) && texto(v.modalidade) === 'VOUCHER';
+export function redeCapturaVoucher(v: VendaAdquirente):string {
+  const layout=String(v.layout_origem||'').trim().toLowerCase();
+  // A conversão do adquirente para COOPCERTO não muda a origem SIPAG.
+  if(redeVoucher(v)==='COOPCERTO' && texto(v.bandeira)==='CABAL' && /^sipag(?:_|$)/.test(layout))return 'SIPAG';
+  return redeVoucher(v);
+}
+export const capturaVoucher = (v: VendaAdquirente) => capturaRedes.has(redeCapturaVoucher(v)) && texto(v.modalidade) === 'VOUCHER';
 export function economicaVoucher(v: VendaAdquirente): boolean {
-  if (!economicasRedes.has(redeVoucher(v))) return false;
+  if (capturaVoucher(v) || !economicasRedes.has(redeVoucher(v))) return false;
   if (texto(v.modalidade) === 'VOUCHER') return true;
   // Estes parsers já separam vendas de pagamentos/ajustes. Os códigos de produto
   // ALELO e descrições VR são preservados na importação, antes das conversões.
@@ -38,6 +44,7 @@ function segundos(v: VendaAdquirente): number | null {
   return h < 24 && m < 60 && sec < 60 ? h*3600+m*60+sec : null;
 }
 export function voucherElegivel(v: VendaAdquirente): boolean {
+  if ((v as any).revisao_coopcerto?.status === 'PENDENTE') return false;
   const status = [v.status_transacao, v.status_transacao_original, v.codigo_registro === 'E' && !String(v.layout_origem).startsWith('cielo_') ? 'ESTORNADO' : ''].map(texto).join(' ');
   const negativa=/(NEGAD|RECUS|REJEIT|REJECT|DECLIN|DENIED|CANCEL|ESTORN|REVERSED|PENDENT|AJUST|DEVOL|UNAUTHORIZED|NAO AUTORIZ)/.test(status);
   const autorizada=/(AUTORIZAD|APROVAD|AUTHORIZED|EFETUAD|CONFIRMAD|REALIZAD|PROCESSAD|LIQUIDAD|CAPTURAD|PAGO|PAGA)/.test(status)

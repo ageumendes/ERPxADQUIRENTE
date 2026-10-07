@@ -1,6 +1,6 @@
 export const theme = {
   appName: 'ERPxADQUIRENTE',
-  version: '0.1.236',
+  version: '0.1.251',
   colors: {
     fundoPrincipal: '#0B0B0B',
     header: '#111111',

@@ -20,7 +20,7 @@ test('v0.1.209 prioriza candidatos manuais somente pela diferença de valor', ()
 });
 
 test('v0.1.209 compacta identificadores e usa logos de bandeira nas filas manuais', () => {
-  assert.match(main, /className="manual-id-column">NSU/);
+  assert.match(main, /className="manual-id-column coluna-limitavel"[^>]+title="NSU"/);
   assert.match(main, /className="manual-id-value" title=\{valorTabela\(v\.nsu\)\}/);
   assert.ok((main.match(/<RenderBandeiraLogo valor=\{v\.bandeira\}\/\>/g) || []).length >= 2);
 });

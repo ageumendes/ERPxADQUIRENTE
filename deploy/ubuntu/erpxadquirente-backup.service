@@ -1,0 +1,18 @@
+[Unit]
+Description=Backup consistente PostgreSQL e storage ERPxADQUIRENTE
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/erpxadquirente/backend.env
+WorkingDirectory=/opt/erpxadquirente/current/backend
+ExecStartPre=/usr/bin/systemctl stop erpxadquirente.service
+ExecStart=/usr/sbin/runuser -u erpxadquirente -- /usr/bin/node /opt/erpxadquirente/current/backend/scripts/backup.mjs /var/backups/erpxadquirente
+ExecStopPost=/usr/bin/systemctl start erpxadquirente.service
+TimeoutStartSec=1800
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/backups/erpxadquirente

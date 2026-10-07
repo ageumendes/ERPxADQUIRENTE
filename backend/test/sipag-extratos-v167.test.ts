@@ -28,11 +28,12 @@ test('extrato de autorizações preserva todas as linhas brutas e gera venda ape
   assert.equal(resultado.vendas_adquirentes[0].codigo_estabelecimento, '106145980001');
   assert.equal(resultado.vendas_adquirentes[0].status_transacao, 'NEGADO');
   assert.equal(resultado.vendas_adquirentes[0].bandeira, '');
-  assert.equal(resultado.vendas_adquirentes[0].dados_json.bin_cartao, '466070');
-  assert.equal(resultado.registros_brutos[1].bandeira, '466070');
+  assert.equal(resultado.registros_brutos[1].bandeira, undefined);
+  assert.equal((resultado.registros_brutos[1].dados_json as Record<string,unknown>)['Nº cartão'], '466070******4225');
+  assert.equal(resultado.vendas_adquirentes[0].dados_json.bin_cartao, undefined);
 });
 
-test('extrato de autorizações preserva o BIN técnico sem gravá-lo na bandeira canônica', async () => {
+test('extrato de autorizações preserva cartão original sem inferir bandeira', async () => {
   const arquivo = await arquivoTemporario('relatorio_transacoes_bandeiras.csv', [
     'Relatório de autorizações', 'Estabelecimento(s);CB-106145980001',
     'Nº Estabelecimento;Autorização;Situação;Documento;Nº terminal;Nº cartão;Tipo;Forma de Pagamento;Nº comprovante;Data Autorização;Valor da transação',
@@ -46,8 +47,8 @@ test('extrato de autorizações preserva o BIN técnico sem gravá-lo na bandeir
   const resultado = await parseSipagExtratoCsv('imp-bandeiras', arquivo, path.basename(arquivo));
   assert.equal(resultado.vendas_adquirentes.length, 0);
   assert.equal(resultado.registros_brutos.length, 5);
-  assert.equal(resultado.registros_brutos[0].bin_cartao, '512707');
-  assert.equal(resultado.registros_brutos[2].criterio_bandeira, 'BIN_CARTAO');
+  assert.equal((resultado.registros_brutos[0].dados_json as Record<string,unknown>)['Nº cartão'], '512707******4509');
+  assert.ok(resultado.registros_brutos.every(r => r.bandeira === undefined && r.bin_cartao === undefined));
 });
 
 test('extrato PIX normaliza prefixo CB e gera venda PIX', async () => {

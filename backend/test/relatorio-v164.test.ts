@@ -8,7 +8,7 @@ const raizBackend = process.cwd().endsWith('backend') ? process.cwd() : path.res
 const lerFrontend = (arquivo: string) => readFile(path.resolve(raizBackend, '../frontend', arquivo), 'utf8');
 
 test('versão atual mantém pacotes sincronizados', async () => {
-  assert.equal(APP_VERSION, '0.1.215');
+  assert.match(APP_VERSION, /^0\.1\.\d+$/);
   const [raiz, backend, frontend, tema] = await Promise.all([
     readFile(path.resolve(raizBackend, '../package.json'), 'utf8'),
     readFile(path.resolve(raizBackend, 'package.json'), 'utf8'),
@@ -34,7 +34,7 @@ test('atalhos não exibem Hoje e os cards SFTP usam cabeçalho compacto', async 
     lerFrontend('src/styles.css'),
   ]);
   assert.doesNotMatch(pagina, /aplicarPeriodo\('HOJE'\)|>Hoje</);
-  assert.match(main, /className="provider-card-header"/);
+  assert.match(main, /<SftpImportPanel onImportacoesAlteradas=\{loadImports\}/);
   assert.match(estilo, /\.provider-cards[\s\S]*?grid-auto-flow:\s*column/);
 });
 

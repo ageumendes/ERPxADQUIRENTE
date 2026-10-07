@@ -1,3 +1,8 @@
+import { bloquearNaoAplicaNaSaida } from './http/bloqueio-nao-aplica.js';
+import './config/env.js';
+import { validarConfiguracaoProducao } from './config/producao.js';
+import { listarArquivosRecursivos } from './services/arquivos-recuperacao.js';
+import { listarPosProcessamentoPendente, concluirPosProcessamento } from './repositories/importacoes.repository.js';
 import { registerSftpBrowserRoutes } from './routes/sftp-browser.routes.js';
 import { simularCorrecao, aplicarCorrecao, resumoPlano } from './services/correcao-vendas.js';
 import express from 'express';
@@ -55,6 +60,7 @@ import {
   salvarCoopcertoExtrato,
   normalizarVendasAdquirentesExistentes,
   executarConciliacaoAutomatica,
+  sincronizarParcelasErpSipag,
   verificarBasesDisponiveisParaConciliacao,
   consolidarVendasVoucherCapturadas,
   prepararConsultasOtimizadas,
@@ -69,46 +75,16 @@ import { cabecalhosSeguranca, limitarRequisicoes, limitarLogin, liberarLimiteLog
 import { agendarRetencaoArquivos } from './services/retencao-arquivos.js';
 import readline from 'node:readline';
 import { APP_VERSION } from './version.js';
-import { closePool } from './database/pool.js';
+import { closePool, getPool } from './database/pool.js';
 
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-async function carregarEnvAutomaticamente() {
-  const candidatos = [
-    path.resolve(process.cwd(), '.env'),
-    path.resolve(process.cwd(), 'backend/.env'),
-    path.resolve(__dirname, '../.env'),
-    path.resolve(__dirname, '../../backend/.env'),
-  ];
+validarConfiguracaoProducao();
 
-  for (const envPath of candidatos) {
-    try {
-      const conteudo = await fs.readFile(envPath, 'utf8');
-      for (const linhaOriginal of conteudo.split(/\r?\n/)) {
-        const linha = linhaOriginal.trim();
-        if (!linha || linha.startsWith('#')) continue;
-        const indice = linha.indexOf('=');
-        if (indice <= 0) continue;
-        const chave = linha.slice(0, indice).trim();
-        let valor = linha.slice(indice + 1).trim();
-        if ((valor.startsWith('"') && valor.endsWith('"')) || (valor.startsWith("'") && valor.endsWith("'"))) {
-          valor = valor.slice(1, -1);
-        }
-        if (process.env[chave] === undefined) process.env[chave] = valor;
-      }
-      console.log(`.env carregado automaticamente de ${envPath}`);
-      return envPath;
-    } catch {
-      // tenta próximo caminho
-    }
-  }
-  console.log('Nenhum arquivo .env encontrado automaticamente. Usando variáveis de ambiente do processo.');
-  return null;
-}
-
-await carregarEnvAutomaticamente();
+let encerrando = false;
+const tarefasEntrada = new Set<Promise<void>>();
 
 const app = express();
 protegerRotasAssincronas(app);
@@ -117,7 +93,10 @@ const versao = APP_VERSION;
 
 const origensPermitidas = String(process.env.CORS_ORIGINS || 'http://localhost:5173,http://127.0.0.1:5173').split(',').map((item) => item.trim()).filter(Boolean);
 app.disable('x-powered-by');
+if (process.env.TRUST_PROXY === 'loopback') app.set('trust proxy', 'loopback');
+app.use((_req, res, next) => encerrando ? res.status(503).json({sucesso:false,mensagem:'Servidor encerrando. Tente novamente em instantes.'}) : next());
 app.use(cabecalhosSeguranca);
+app.use('/api', bloquearNaoAplicaNaSaida);
 app.use(limitarRequisicoes);
 app.use(cors({ origin(origin, callback) { if (!origin || origensPermitidas.includes(origin)) return callback(null, true); callback(new Error('Origem não permitida pelo CORS.')); }, credentials: false }));
 app.use(express.json({ limit: '2mb' }));
@@ -133,6 +112,11 @@ app.use((req, res, next) => {
   next();
 });
 
+const inicializacaoSipag = { status: 'PENDENTE' as 'PENDENTE' | 'EM_ANDAMENTO' | 'CONCLUIDA' | 'FALHOU', concluida_em: '' };
+const instanciaDb = await getPool().connect();
+const instanciaLock = await instanciaDb.query('SELECT pg_try_advisory_lock(242, 0) AS obtido');
+if (!instanciaLock.rows[0]?.obtido) { instanciaDb.release(); throw new Error('Outra instância do app já está utilizando este banco.'); }
+instanciaDb.on('error', error => { console.error('[database] Conexão de exclusividade perdida.', error.message); process.exit(1); });
 await bootstrapDatabase();
 console.log('[database] Verificando índices de consulta e conciliação...');
 await prepararConsultasOtimizadas();
@@ -140,6 +124,11 @@ console.log('[database] Índices de consulta e conciliação prontos.');
 await inicializarSeguranca();
 
 app.get('/api/health', (_req, res) => res.json({ app: 'ERPxADQUIRENTE', versao, status: 'online', autenticacao: 'obrigatoria' }));
+app.get('/api/ready', async (_req, res) => {
+  try { await getPool().query('SELECT 1'); res.json({status:'ready', versao, agrupamento_sipag: inicializacaoSipag,
+    pool: { total: getPool().totalCount, ociosas: getPool().idleCount, esperando: getPool().waitingCount }}); }
+  catch { res.status(503).json({status:'not_ready'}); }
+});
 app.post('/api/auth/login', limitarLogin, async (req, res) => {
   const resultado = await login(req.body?.login, req.body?.senha);
   if (!resultado) {
@@ -172,6 +161,7 @@ app.use('/api/auditoria', exigirAdmin);
 app.use('/api/vendas-adquirentes/normalizar', exigirAdmin);
 app.use('/api/vendas-adquirentes/recalcular-percentual-taxa', exigirAdmin);
 app.use('/api/correcao-vendas', exigirAdmin);
+app.use('/api/importacoes/sftp', exigirEscrita);
 app.use('/api/importacoes', (req, res, next) => ['GET', 'HEAD'].includes(req.method) ? next() : exigirEscrita(req, res, next));
 app.use('/api/imports', (req, res, next) => ['GET', 'HEAD'].includes(req.method) ? next() : exigirEscrita(req, res, next));
 
@@ -502,7 +492,13 @@ async function moverParaProcessandoSeNecessario(caminhoAtual: string, nomeOrigin
   return moverPreservandoNome(caminhoAtual, processandoDir, nomeOriginal || path.basename(caminhoAtual));
 }
 
-function enfileirarImportacao(params: Omit<TarefaImportacao, 'resolve' | 'reject'>): Promise<string> {
+async function enfileirarImportacao(params: Omit<TarefaImportacao, 'resolve' | 'reject'>): Promise<string> {
+    const caminhoNormalizado = path.resolve(params.caminhoArquivo);
+    if (caminhosEnfileiradosOuEmProcessamento.has(caminhoNormalizado)) return 'JA_ENFILEIRADO';
+    caminhosEnfileiradosOuEmProcessamento.add(caminhoNormalizado);
+    try {
+      await atualizarImportacao(params.importacaoId, {status_importacao:'ENFILEIRADO',caminho_arquivo:caminhoNormalizado,nome_arquivo_salvo:path.basename(caminhoNormalizado),mensagem_erro:null});
+    } catch(error) { caminhosEnfileiradosOuEmProcessamento.delete(caminhoNormalizado); throw error; }
   return new Promise((resolve, reject) => {
     // A chegada de um novo arquivo reabre o lote. Se a fila havia zerado e o
     // pós-processamento estava apenas AGENDADO, cancela o disparo para consumir
@@ -513,22 +509,7 @@ function enfileirarImportacao(params: Omit<TarefaImportacao, 'resolve' | 'reject
       console.log('[fila-importacao] novo arquivo recebido; pós-processamento agendado foi adiado para o fim do lote.');
     }
 
-    const caminhoNormalizado = path.resolve(params.caminhoArquivo);
-    if (caminhosEnfileiradosOuEmProcessamento.has(caminhoNormalizado)) {
-      resolve('JA_ENFILEIRADO');
-      return;
-    }
-    caminhosEnfileiradosOuEmProcessamento.add(caminhoNormalizado);
-    filaImportacao.push({ ...params, caminhoArquivo: caminhoNormalizado, resolve, reject });
-    // Persiste o estado "ENFILEIRADO" imediatamente. Assim o frontend deixa de
-    // mostrar o arquivo como apenas "Recebido/entrada" quando ele já está na fila,
-    // mesmo que existam outros arquivos sendo processados antes dele.
-    void atualizarImportacao(params.importacaoId, {
-      status_importacao: 'ENFILEIRADO',
-      caminho_arquivo: caminhoNormalizado,
-      nome_arquivo_salvo: path.basename(caminhoNormalizado),
-      mensagem_erro: null,
-    }).catch((error) => logErroImportacao(`enfileirar:${params.importacaoId}`, error));
+    filaImportacao.push({ ...params, caminhoArquivo:caminhoNormalizado, resolve, reject });
     console.log(`[fila-importacao] enfileirado ${params.importacaoId} (${params.nomeOriginal}). Pendentes: ${filaImportacao.length}`);
     void processarFilaImportacao();
   });
@@ -649,6 +630,7 @@ async function executarPosProcessamentoImportacoesSeNecessario(): Promise<void> 
       } else {
         console.log('[pos-importacao] lote sem vendas conciliáveis; consolidação e conciliação dispensadas.');
       }
+      await concluirPosProcessamento(importacaoIds);
       posProcessamentoConcluido = true;
     } catch (error) {
       lotePossuiNovaImportacaoConciliavel = true;
@@ -760,8 +742,9 @@ async function recuperarArquivosProcessando(limite: number, contexto: 'boot' | '
   await fs.mkdir(processandoDir, { recursive: true });
   await fs.mkdir(entradaDir, { recursive: true });
 
-  const itens = await fs.readdir(processandoDir, { withFileTypes: true }).catch(() => []);
-  const arquivos = itens.filter((item) => item.isFile() && !nomeArquivoTemporario(item.name));
+  const arquivos = (await listarArquivosRecursivos(processandoDir))
+    .filter(caminho => !nomeArquivoTemporario(path.basename(caminho)) && !caminhosEnfileiradosOuEmProcessamento.has(path.resolve(caminho)))
+    .map(caminho => ({name:path.basename(caminho),caminho}));
   const maxRecuperar = Math.max(0, Number(limite || 0));
   const selecionados = maxRecuperar === 0 ? [] : arquivos.slice(0, maxRecuperar);
   const recuperadosDetalhes: { nome: string; destino: string }[] = [];
@@ -769,7 +752,7 @@ async function recuperarArquivosProcessando(limite: number, contexto: 'boot' | '
   let exibidos = 0;
 
   for (const item of selecionados) {
-    const caminhoProcessando = path.join(processandoDir, item.name);
+    const caminhoProcessando = item.caminho;
     try {
       const destinoEntrada = await moverPreservandoNome(caminhoProcessando, entradaDir, item.name);
       recuperadosDetalhes.push({ nome: item.name, destino: path.basename(destinoEntrada) });
@@ -806,7 +789,12 @@ async function recuperarArquivosProcessando(limite: number, contexto: 'boot' | '
 }
 
 async function recuperarImportacoesInterrompidasNoBoot() {
-  await recuperarArquivosProcessando(Number(process.env.IMPORTACOES_RECUPERAR_MAX_BOOT || 50), 'boot');
+  await recuperarArquivosProcessando(Number.MAX_SAFE_INTEGER, 'boot');
+  for(const imp of await listarPosProcessamentoPendente()) {
+    importacoesPendentesPosProcessamento.add(imp.id);
+    lotePossuiNovaImportacaoConciliavel = true;
+  }
+  agendarPosProcessamentoImportacoes(0);
 }
 
 
@@ -822,11 +810,11 @@ function iniciarWatcherImportacoesEntrada() {
   let rodando = false;
 
   async function varrerEntrada() {
-    if (rodando) return;
+    if (rodando || encerrando) return;
     rodando = true;
     try {
       await fs.mkdir(entradaDir, { recursive: true });
-      const itens = await fs.readdir(entradaDir, { withFileTypes: true });
+      const itens = (await listarArquivosRecursivos(entradaDir)).map(caminho=>({name:path.basename(caminho),caminho}));
       const agora = Date.now();
 
       const maxPorVarredura = Math.max(1, Number(process.env.IMPORTACOES_WATCHER_MAX_POR_VARREDURA || 10));
@@ -834,10 +822,10 @@ function iniciarWatcherImportacoesEntrada() {
 
       for (const item of itens) {
         if (enfileiradosNestaVarredura >= maxPorVarredura) break;
-        if (!item.isFile()) continue;
+        if (encerrando) break;
         if (nomeArquivoTemporario(item.name)) continue;
 
-        const caminho = path.join(entradaDir, item.name);
+        const caminho = item.caminho;
         const caminhoNormalizado = path.resolve(caminho);
         // O watcher só enfileira arquivos manuais. Se o upload/SFTP já enfileirou o mesmo caminho,
         // não deve mover nem classificar novamente, evitando race condition e ENOENT.
@@ -874,9 +862,11 @@ function iniciarWatcherImportacoesEntrada() {
     }
   }
 
-  setTimeout(varrerEntrada, 3000);
-  setInterval(varrerEntrada, Number(process.env.IMPORTACOES_WATCHER_INTERVAL_MS || 5000));
+  const varrer = () => { const tarefa=varrerEntrada(); tarefasEntrada.add(tarefa); void tarefa.finally(()=>tarefasEntrada.delete(tarefa)); };
+  const inicial = setTimeout(varrer, 3000);
+  const timer = setInterval(varrer, Number(process.env.IMPORTACOES_WATCHER_INTERVAL_MS || 5000));
   console.log(`Watcher ativo em ${entradaDir}. Arquivos colados manualmente serão importados automaticamente.`);
+  return () => { clearTimeout(inicial); clearInterval(timer); };
 }
 
 
@@ -972,6 +962,7 @@ async function contarLinhasNaoVaziasArquivo(caminhoArquivo: string): Promise<num
 
 async function processarClassificacao(importacaoId: string, caminhoArquivo: string, nomeOriginal: string): Promise<string> {
   try {
+    if ((await fs.stat(caminhoArquivo)).size > 50 * 1024 * 1024) throw new Error('O arquivo excede o limite máximo de 50 MB.');
     await atualizarImportacao(importacaoId, { status_importacao: 'CLASSIFICANDO' });
     const resultado = await classificarArquivo(caminhoArquivo, nomeOriginal);
     // v0.1.185: persiste a classificação assim que ela é conhecida. Em arquivos grandes,
@@ -1189,6 +1180,7 @@ async function processarClassificacao(importacaoId: string, caminhoArquivo: stri
         ? 'Layout não reconhecido pelos importadores configurados. Arquivo arquivado em erro/layout_desconhecido sem alteração do nome.'
         : avisoConflitos || null,
       status_importacao: statusFinal,
+      pos_processamento_pendente: statusFinal === 'PROCESSADO',
     });
     return statusFinal;
   } catch (error) {
@@ -1444,8 +1436,8 @@ app.post('/api/importacoes/cielo_layout_15_15', upload.single('file'), receberUp
 app.post('/api/importacoes/convcard_layout_2_0_3', upload.single('file'), receberUploadConvcard203);
 
 await recuperarImportacoesInterrompidasNoBoot();
-iniciarWatcherImportacoesEntrada();
-agendarRetencaoArquivos();
+const pararWatcher = iniciarWatcherImportacoesEntrada();
+const pararRetencao = agendarRetencaoArquivos();
 
 app.use((error: Error, _req: Request, res: Response, _next: NextFunction) => {
   logErroImportacao('middleware', error);
@@ -1463,12 +1455,42 @@ app.use((error: Error, _req: Request, res: Response, _next: NextFunction) => {
   });
 });
 
-const servidor = app.listen(port, '0.0.0.0', () => {
+// Recupera agrupamentos históricos sem bloquear as consultas HTTP de leitura.
+inicializacaoSipag.status = 'EM_ANDAMENTO';
+const agrupamentoInicial = sincronizarParcelasErpSipag(true).then(() => {
+  inicializacaoSipag.status = 'CONCLUIDA';
+  inicializacaoSipag.concluida_em = new Date().toISOString();
+}).catch(error => {
+  inicializacaoSipag.status = 'FALHOU';
+  console.error('[agrupamento-sipag] Falha na atualização inicial; nova tentativa no próximo processamento.', error);
+});
+
+const servidor = app.listen(port, process.env.HOST || '127.0.0.1', () => {
   console.log(`ERPxADQUIRENTE backend v${versao} online em http://localhost:${port}`);
 });
 
 for (const sinal of ['SIGTERM', 'SIGINT'] as const) {
   process.once(sinal, () => {
-    servidor.close(() => void closePool().finally(() => process.exit(0)));
+    encerrando = true;
+    pararWatcher?.();
+    pararRetencao();
+    cancelarAgendamentoPosProcessamentoImportacoes();
+    const timeout = setTimeout(() => {
+      console.error('[shutdown] Limite excedido; trabalho persistido será recuperado no próximo início.');
+      process.exit(1);
+    }, Math.max(10_000, Number(process.env.SHUTDOWN_TIMEOUT_MS || 300_000))).unref();
+    const httpFechado = new Promise<void>(resolve => servidor.close(() => resolve()));
+    void (async () => {
+      await Promise.allSettled([...tarefasEntrada]);
+      await httpFechado;
+      while(filaRodando || tarefaAtual || filaImportacao.length || posProcessamentoImportacaoRodando) await sleep(100);
+      await executarPosProcessamentoImportacoesSeNecessario();
+      await Promise.allSettled([agrupamentoInicial, conciliacaoAutomaticaRodando, consolidacaoVoucherRodando].filter(Boolean));
+      await instanciaDb.query('SELECT pg_advisory_unlock(242, 0)');
+      instanciaDb.release();
+      await closePool();
+      clearTimeout(timeout);
+      process.exit(0);
+    })().catch(error => { console.error('[shutdown]',error); process.exit(1); });
   });
 }

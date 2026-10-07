@@ -1,7 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import type { VendaAdquirente } from '../repositorio.js';
-import { identificarBandeiraCartao } from '../services/bandeira-cartao.js';
 
 export type TipoExtratoSipag = 'TRANSACOES_AUTORIZADAS' | 'VENDAS_REALIZADAS' | 'VENDAS_PIX' | 'VENDAS_A_RECEBER' | 'VENDAS_RECEBIDAS';
 type RegistroExtrato = Record<string, unknown> & { id: string; importacao_id: string; hash_linha: string };
@@ -106,12 +105,6 @@ export async function parseSipagExtratoCsv(importacaoId: string, caminhoArquivo:
       // Preserve todas as linhas originais no extrato bruto. Vendas aprovadas
       // pertencem ao EDI, que contém bandeira e informações financeiras.
       const status = statusAutorizacao(valores[2]);
-      const identificacaoBandeira = identificarBandeiraCartao(valores[5]);
-      Object.assign(registros_brutos.at(-1)!, {
-        bandeira: identificacaoBandeira.bandeira,
-        bin_cartao: identificacaoBandeira.bin,
-        criterio_bandeira: identificacaoBandeira.criterio,
-      });
       if (status !== 'NEGADO') continue;
       const dh = dataHora(valores[9]); const bruto = moeda(valores[10]);
       vendas_adquirentes.push({
@@ -122,11 +115,10 @@ export async function parseSipagExtratoCsv(importacaoId: string, caminhoArquivo:
         valor_bruto: bruto.toFixed(2), valor_taxa: '0.00', percentual_taxa: '0.0000', valor_liquido: bruto.toFixed(2),
         nsu: valores[8] === '-' ? '' : valores[8], codigo_autorizacao: valores[1], terminal: valores[4],
         // O relatório de autorizações fornece número do cartão, não bandeira.
-        // O BIN permanece no dado técnico e a coluna canônica só recebe a
-        // bandeira textual quando o relatório Vendas realizadas complementar.
+        // A bandeira permanece vazia quando não é informada pelo arquivo.
         bandeira: '', modalidade: normalizar(valores[7]), parcelas: '1/1', status_transacao: status,
         status_transacao_original: valores[2], codigo_produto: valores[6], hash_linha: h, linha_original: linha,
-        dados_json: { ...original, codigo_estabelecimento_original: estabelecimentoOriginal, bin_cartao: identificacaoBandeira.bin, criterio_bandeira: identificacaoBandeira.criterio }, data_criacao: new Date().toISOString(),
+        dados_json: { ...original, codigo_estabelecimento_original: estabelecimentoOriginal }, data_criacao: new Date().toISOString(),
       });
     }
 

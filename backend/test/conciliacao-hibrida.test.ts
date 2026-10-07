@@ -106,10 +106,15 @@ test('aceita data D+1 quando valor e identificadores são compatíveis', () => {
   assert.ok(resultado?.criterios.includes('Parcelas iguais'));
 });
 
-test('rejeita candidato quando ambos informam parcelas diferentes', () => {
+test('SIPAG mantém NSU + valor + data como regra principal mesmo com parcelas divergentes', () => {
   const resultado = avaliarCandidatoHibrido(
     adq({ adquirente: 'SIPAG', nsu: '123', parcelas: '2' }),
     erp({ nsu: '123', parcelas: '3' }),
   );
-  assert.equal(resultado, null);
+  assert.equal(resultado?.estrategia, 'NSU_VALOR_DATA');
+  assert.equal(resultado?.score, 100);
+});
+
+test('CIELO não aceita parcelas divergentes sem evidências da camada de recuperação', () => {
+  assert.equal(avaliarCandidatoHibrido(adq({parcelas:'2'}),erp({parcelas:'3'})),null);
 });

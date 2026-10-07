@@ -135,5 +135,7 @@ test('Vite separa CSP de desenvolvimento e produção', async () => {
   assert.match(vite, /preview:\s*\{\s*headers: productionSecurityHeaders/);
   assert.match(vite, /developmentSecurityHeaders[\s\S]+unsafe-inline/);
   const producao = vite.slice(vite.indexOf('const productionSecurityHeaders'));
-  assert.doesNotMatch(producao.slice(0, producao.indexOf('export default')), /unsafe-inline/);
+  assert.match(producao, /script-src 'self';/);
+  assert.doesNotMatch(producao, /script-src[^;]+unsafe-inline/);
+  assert.match(producao, /style-src 'self' 'unsafe-inline'/);
 });

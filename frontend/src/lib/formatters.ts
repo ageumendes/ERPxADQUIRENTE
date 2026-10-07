@@ -101,3 +101,24 @@ export function normalizarDataHora(data?: unknown, hora?: unknown) {
   return horaJaContemData ? horaTexto : `${dataTexto} ${horaTexto}`;
 }
 
+
+/** Exibição somente: não altera a hora usada pelo motor de conciliação. */
+export function formatarHoraVenda(valor: unknown): string {
+  const texto = String(valor ?? '').trim();
+  if (!texto || texto === '-') return '00:00:00';
+  const separado = texto.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/)
+    || texto.match(/(?:T|\s)(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+  const compacto = /^\d{1,6}$/.test(texto) ? texto.padStart(6,'0') : '';
+  const partes = separado ? [separado[1], separado[2], separado[3] || '00']
+    : compacto ? [compacto.slice(0,2), compacto.slice(2,4), compacto.slice(4,6)] : null;
+  if (!partes || Number(partes[0]) > 23 || Number(partes[1]) > 59 || Number(partes[2]) > 59) return texto;
+  return partes.map(p => p.padStart(2,'0')).join(':');
+}
+
+/** Líquido ausente/zero da adquirente usa bruto apenas na apresentação. */
+export function formatarLiquidoAdquirente(venda: {valor_liquido?: unknown; valor_bruto?: unknown}): string {
+  const liquido = venda.valor_liquido;
+  const texto = String(liquido ?? '').trim();
+  const zerado = /^[-+]?0+(?:[.,]0+)*$/.test(texto.replace(/^R\$\s*/, '').replace(/\s/g,''));
+  return formatarMoedaBrasil(!texto || texto === '-' || zerado ? venda.valor_bruto : liquido);
+}

@@ -1,3 +1,4 @@
+import { validarSegredo } from '../config/producao.js';
 import type { NextFunction, Request, Response } from 'express';
 import { createHmac, randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
@@ -39,14 +40,11 @@ function guardarTokenEmCache(token: string, usuario: UsuarioAutenticado, expiraE
     if (tokensValidados.size <= TOKEN_CACHE_LIMITE) break;
   }
 }
-function obterSegredo() {
-  const segredo = String(process.env.AUTH_SECRET || '');
-  if (segredo.length < 32 || segredo.startsWith('SUBSTITUA_')) throw new Error('AUTH_SECRET deve ser configurada com um segredo real de pelo menos 32 caracteres.');
-  return segredo;
-}
+function obterSegredo() { return validarSegredo('AUTH_SECRET', process.env.AUTH_SECRET); }
 
 export async function inicializarSeguranca() {
   const total = Number((await db().query('SELECT COUNT(*)::int AS total FROM usuarios')).rows[0]?.total || 0);
+  obterSegredo();
   if (total) return;
   const senha = String(process.env.ADMIN_INITIAL_PASSWORD || '').trim();
   if (senha.length < 8 || senha.startsWith('SUBSTITUA_')) throw new Error('ADMIN_INITIAL_PASSWORD deve ser definida com uma senha temporária real de pelo menos 8 caracteres na primeira inicialização.');

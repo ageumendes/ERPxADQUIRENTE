@@ -19,6 +19,7 @@ import {
   listarConciliacoesComExibicao,
   executarConciliacaoAutomatica,
   confirmarConciliacao,
+  tratarRevisaoCoopcerto,
   desfazerConciliacao,
   obterDetalhesConciliacao,
   operarConciliacoesEmLote,
@@ -34,6 +35,7 @@ import { obterStatusRemoteEdi } from '../remote-edi.js';
 import { registerAuditoriaRoutes } from './auditoria.routes.js';
 import { registerConversoesRoutes } from './conversoes.routes.js';
 import { checklistImportacoesDiarias } from '../config/importacoes-diarias.js';
+import { autorizar } from '../security/auth.js';
 import { getPool } from '../database/pool.js';
 import { excluirImportacaoFalhaOuDuplicada } from '../repositories/importacoes.repository.js';
 import { executarComAtividadeSegundoPlano } from '../services/atividade-segundo-plano.js';
@@ -175,7 +177,7 @@ async function gerarDashboardPendenciasImportacao(dataReferencia = dataBrasilAtu
   const resultado = await getPool().query<{ importacao: Importacao; data_itens: string; quantidade_registros: number }>(`
     WITH registros_finais AS (
       SELECT dados->>'importacao_id' AS importacao_id, ${dataNormalizada('v')} AS data_itens
-      FROM vendas_adquirentes v
+      FROM vendas_adquirentes v WHERE v.registro_nao_aplicavel = FALSE
       UNION ALL
       SELECT dados->>'importacao_id' AS importacao_id, ${dataNormalizada('v')} AS data_itens
       FROM vendas_interdata v
@@ -401,6 +403,15 @@ export function registerCoreRoutes(app: Express, deps: CoreRoutesDeps) {
     res.json(await listarVendasErpComExibicao(limite, offset, filtros));
   });
 
+  app.post('/api/vendas-adquirentes/:id/revisao-coopcerto', autorizar(['ADMINISTRADOR', 'FINANCEIRO']), async (req, res) => {
+    try {
+      res.json(await tratarRevisaoCoopcerto(req.params.id, String(req.body?.hash_recebido || ''),
+        String(req.body?.motivo || ''), req.usuario || {}));
+    } catch (error) {
+      res.status(400).json({ sucesso: false, mensagem: error instanceof Error ? error.message : 'Não foi possível tratar a revisão.' });
+    }
+  });
+
   app.get('/api/vendas-adquirentes/opcoes', async (req, res) => {
     try {
       res.json(await obterOpcoesVendasAdquirentes(req.query));
@@ -497,7 +508,7 @@ export function registerCoreRoutes(app: Express, deps: CoreRoutesDeps) {
     try {
       const lado = String(req.query.lado || 'ERP').toUpperCase() === 'ADQUIRENTE' ? 'ADQUIRENTE' : 'ERP';
       res.setHeader('Cache-Control', 'no-store');
-      res.json(await listarCandidatosConciliacaoManual(lado, Number(req.query.limite || 80), Number(req.query.offset || 0), String(req.query.busca || ''), String(req.query.adquirente || ''), String(req.query.data_inicial || ''), String(req.query.data_final || ''), String(req.query.estabelecimento || ''), String(req.query.priorizar_erp_id || '')));
+      res.json(await listarCandidatosConciliacaoManual(lado, Number(req.query.limite || 80), Number(req.query.offset || 0), String(req.query.busca || ''), String(req.query.adquirente || ''), String(req.query.data_inicial || ''), String(req.query.data_final || ''), String(req.query.estabelecimento || ''), String(req.query.priorizar_erp_id || ''), req.query.status === undefined ? 'AUTORIZADO' : String(req.query.status)));
     } catch (error) { res.status(500).json({sucesso:false,mensagem:error instanceof Error?error.message:'Erro ao listar candidatos manuais.'}); }
   });
 

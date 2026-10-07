@@ -1,3 +1,4 @@
+import { ParcelasErp } from './components/ParcelasErp';
 import { SftpFilesDialog } from './components/SftpFilesDialog';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
@@ -8,7 +9,7 @@ import { API_URL, apiFetch, publicApiFetch } from './lib/api';
 import { AppShell } from './components/AppShell';
 import logoTigre from './assets/logo-tigre.png';
 import { formatBytes, statusLabel } from './lib/importacoes';
-import { formatarMoedaBrasil, normalizarData, valorTabela } from './lib/formatters';
+import { formatarHoraVenda, formatarLiquidoAdquirente, formatarMoedaBrasil, normalizarData, valorTabela } from './lib/formatters';
 import type { DashboardPendenciasImportacao, Importacao, ImportacoesPoll } from './types/importacoes';
 import { AuditoriaReversoesPage } from './pages/AuditoriaReversoesPage';
 import { DuplicidadesPage } from './pages/DuplicidadesPage';
@@ -100,7 +101,7 @@ function Dashboard() {
 
   function dataAtualSaoPaulo() {
     const partes = new Intl.DateTimeFormat('en-CA', {
-      timeZone: 'America/Sao_Paulo', year: 'numeric', month: '2-digit', day: '2-digit',
+      timeZone: 'America/La_Paz', year: 'numeric', month: '2-digit', day: '2-digit',
     }).formatToParts(new Date());
     const mapa = Object.fromEntries(partes.map((parte) => [parte.type, parte.value]));
     return `${mapa.year}-${mapa.month}-${mapa.day}`;
@@ -1161,6 +1162,8 @@ function ConciliacoesPage() {
   const [manualAdqSelecionado, setManualAdqSelecionado] = useState<string>('');
   const [manualBuscaErp, setManualBuscaErp] = useState('');
   const [manualBuscaAdq, setManualBuscaAdq] = useState('');
+  const [manualStatusAdq, setManualStatusAdq] = useState('AUTORIZADO');
+  const [manualOpcoesStatus, setManualOpcoesStatus] = useState<string[]>(['AUTORIZADO']);
   const [manualRecebimento, setManualRecebimento] = useState(false);
   const [manualMotivo, setManualMotivo] = useState('Conciliação manual validada pelo usuário.');
   const [manualLoading, setManualLoading] = useState(false);
@@ -1186,8 +1189,7 @@ function ConciliacoesPage() {
 
   function horaVenda(venda?: VendaErp | VendaAdquirente | null) {
     const origem = String(venda?.hora_venda || (venda as VendaAdquirente | undefined)?.data_venda_hora || '').trim();
-    const match = origem.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
-    return match ? `${String(Number(match[1])).padStart(2, '0')}:${match[2]}:${match[3] || '00'}` : '-';
+    return formatarHoraVenda(origem);
   }
 
   function dataHoraVenda(venda?: VendaErp | VendaAdquirente | null) {
@@ -1407,12 +1409,14 @@ function ConciliacoesPage() {
     proximoOffsetAdq = manualOffsetAdq,
     filtrosAplicados = filtros,
     priorizarErpId = manualErpSelecionado,
+    statusAdq = manualStatusAdq,
   ) {
     setManualLoading(true);
     setManualMensagem('');
     try {
       const paramsErp = new URLSearchParams({lado:'ERP',limite:String(manualLimite),offset:String(proximoOffsetErp)});
       const paramsAdq = new URLSearchParams({lado:'ADQUIRENTE',limite:String(manualLimite),offset:String(proximoOffsetAdq)});
+      paramsAdq.set('status', statusAdq);
       if (buscaErp.trim()) paramsErp.set('busca', buscaErp.trim());
       if (buscaAdq.trim()) paramsAdq.set('busca', buscaAdq.trim());
       if (filtrosAplicados.data_inicial) { paramsErp.set('data_inicial', filtrosAplicados.data_inicial); paramsAdq.set('data_inicial', filtrosAplicados.data_inicial); }
@@ -1429,6 +1433,7 @@ function ConciliacoesPage() {
       if (!respAdq.ok) throw new Error(dataAdq?.mensagem || 'Erro ao carregar pendências das adquirentes.');
       setManualErp(dataErp.linhas || []);
       setManualAdq(dataAdq.linhas || []);
+      setManualOpcoesStatus(Array.from(new Set(['AUTORIZADO', ...(dataAdq.opcoes_status || [])])));
       setManualTotalErp(Number(dataErp.total_linhas || 0));
       setManualTotalAdq(Number(dataAdq.total_linhas || 0));
       setManualOffsetErp(Number(dataErp.offset || 0));
@@ -1456,8 +1461,10 @@ function ConciliacoesPage() {
     await carregarManual(manualBuscaErp, manualBuscaAdq, 0, 0, filtros, '');
   }
 
+  const manualAdqAutorizado = manualAdq.some(v => v.id === manualAdqSelecionado && String(v.status_transacao || '').trim().toUpperCase() === 'AUTORIZADO');
+
   async function aplicarConciliacaoManual() {
-    if (!manualAdqSelecionado || (!manualErpSelecionado && !manualRecebimento)) return;
+    if (!manualAdqAutorizado || !manualAdqSelecionado || (!manualErpSelecionado && !manualRecebimento)) return;
     setManualLoading(true);
     setManualMensagem('');
     try {
@@ -1567,15 +1574,17 @@ function ConciliacoesPage() {
       ['Data', dataVendaPadronizada(item.venda_interdata), dataVendaPadronizada(item.venda_adquirente), resultadoComparacao(item, 'Data', dataVendaPadronizada(item.venda_interdata), dataVendaPadronizada(item.venda_adquirente))],
       ['Hora', horaVenda(item.venda_interdata), horaVenda(item.venda_adquirente), resultadoComparacao(item, 'Hora', horaVenda(item.venda_interdata), horaVenda(item.venda_adquirente))],
       ['Valor', formatarMoedaBrasil(item.venda_interdata.valor_bruto), formatarMoedaBrasil(item.venda_adquirente.valor_bruto), resultadoComparacao(item, 'Valor', item.venda_interdata.valor_bruto, item.venda_adquirente.valor_bruto)],
+      ['Valor líquido', formatarMoedaBrasil(item.venda_interdata.valor_liquido), formatarLiquidoAdquirente(item.venda_adquirente), 'Informativo'],
       ['Loja', estabelecimentoVenda(item.venda_interdata), estabelecimentoVenda(item.venda_adquirente), resultadoComparacao(item, 'Loja', estabelecimentoVenda(item.venda_interdata), estabelecimentoVenda(item.venda_adquirente))],
       ['Modalidade', modalidadeErp(item.venda_interdata), valorTabela(item.venda_adquirente.modalidade), resultadoComparacao(item, 'Modalidade', modalidadeErp(item.venda_interdata), item.venda_adquirente.modalidade)],
       ['Bandeira', valorTabela(item.venda_interdata.bandeira), valorTabela(item.venda_adquirente.bandeira), resultadoComparacao(item, 'Bandeira', item.venda_interdata.bandeira, item.venda_adquirente.bandeira)],
-      ['Parcelas', valorTabela(item.venda_interdata.parcelas), valorTabela(item.venda_adquirente.parcelas), resultadoComparacao(item, 'Parcelas', item.venda_interdata.parcelas, item.venda_adquirente.parcelas)],
+      ['Parcelas', item.venda_interdata.agrupamento_parcelas?.length ? `${item.venda_interdata.agrupamento_parcelas.length} parcelas` : valorTabela(item.venda_interdata.parcelas), valorTabela(item.venda_adquirente.parcelas), resultadoComparacao(item, 'Parcelas', item.venda_interdata.parcelas, item.venda_adquirente.parcelas)],
       ['NSU', valorTabela(item.venda_interdata.nsu), valorTabela(item.venda_adquirente.nsu), resultadoComparacao(item, 'NSU', item.venda_interdata.nsu, item.venda_adquirente.nsu)],
       ['Autorização', valorTabela((item.venda_interdata as any).codigo_autorizacao), valorTabela(item.venda_adquirente.codigo_autorizacao), resultadoComparacao(item, 'Autorização', (item.venda_interdata as any).codigo_autorizacao, item.venda_adquirente.codigo_autorizacao)],
     ];
     return (
       <div className="conciliacao-comparison-card">
+        {item.venda_interdata?.agrupamento_parcelas?.length && <ParcelasErp venda={item.venda_interdata}/>}
         <table className="conciliacao-comparison-grid">
           <thead><tr><th>Campo</th><th>ERP</th><th>Adquirente</th><th>Resultado</th></tr></thead>
           <tbody>{linhasComparacao.map(([campo, erp, adq, resultado]) => <tr key={campo}><th>{campo}</th><td>{erp}</td><td>{adq}</td><td className={resultado.startsWith('✓') ? 'comparison-ok' : resultado === '—' ? '' : 'comparison-warning'}>{resultado}</td></tr>)}</tbody>
@@ -1611,7 +1620,7 @@ function ConciliacoesPage() {
               <input value={manualBuscaErp} onChange={e=>setManualBuscaErp(e.target.value)} onKeyDown={e=>{if(e.key==='Enter')carregarManual(manualBuscaErp,manualBuscaAdq,0,manualOffsetAdq)}} placeholder="Buscar nesta tabela: NSU, autorização ou valor"/>
               <button className="secondary" onClick={()=>carregarManual(manualBuscaErp,manualBuscaAdq,0,manualOffsetAdq)} disabled={manualLoading}>Buscar</button>
             </div>
-            <div className="manual-table-wrap"><table><thead><tr><th></th><th className="coluna-limitavel" style={estiloLarguraColuna(LARGURAS_COLUNAS.conciliacoes.loja)} title="Loja"><span className="coluna-header-texto">Loja</span></th><th className="coluna-limitavel" style={estiloLarguraColuna(LARGURAS_COLUNAS.conciliacoes.data_venda)} title="Data venda"><span className="coluna-header-texto">Data venda</span></th><th className="coluna-limitavel" style={estiloLarguraColuna(LARGURAS_COLUNAS.conciliacoes.hora)} title="Hora"><span className="coluna-header-texto">Hora</span></th><th className="coluna-limitavel" style={estiloLarguraColuna(LARGURAS_COLUNAS.conciliacoes.valor_bruto)} title="Valor bruto"><span className="coluna-header-texto">Valor bruto</span></th><th className="coluna-limitavel" style={estiloLarguraColuna(LARGURAS_COLUNAS.conciliacoes.modalidade)} title="Modalidade"><span className="coluna-header-texto">Modalidade</span></th><th className="coluna-limitavel" style={estiloLarguraColuna(LARGURAS_COLUNAS.conciliacoes.bandeira)} title="Bandeira"><span className="coluna-header-texto">Bandeira</span></th><th className="coluna-limitavel" style={estiloLarguraColuna(LARGURAS_COLUNAS.conciliacoes.parcelas)} title="Parcelas"><span className="coluna-header-texto">Parcelas</span></th><th className="manual-id-column coluna-limitavel" style={estiloLarguraColuna(LARGURAS_COLUNAS.conciliacoes.nsu)} title="NSU"><span className="coluna-header-texto">NSU</span></th><th className="manual-id-column coluna-limitavel" style={estiloLarguraColuna(LARGURAS_COLUNAS.conciliacoes.autorizacao)} title="Autorização"><span className="coluna-header-texto">Autorização</span></th></tr></thead><tbody>{manualErp.map(v=><tr key={v.id} className={manualErpSelecionado===v.id?'manual-selected':''} onClick={()=>void selecionarVendaErp(v.id)}><td><input type="radio" checked={manualErpSelecionado===v.id} onClick={e=>e.stopPropagation()} onChange={()=>void selecionarVendaErp(v.id)}/></td><td>{estabelecimentoVenda(v)}</td><td>{dataVendaPadronizada(v)}</td><td>{horaVenda(v)}</td><td>{formatarMoedaBrasil(v.valor_bruto)}</td><td>{modalidadeErp(v)}</td><td className="coluna-limitavel manual-col-bandeira"><RenderBandeiraLogo valor={v.bandeira}/></td><td className="coluna-limitavel manual-col-parcelas">{valorTabela(v.parcelas)}</td><td className="manual-id-column"><span className="manual-id-value" title={valorTabela(v.nsu)}>{valorTabela(v.nsu)}</span></td><td className="manual-id-column"><span className="manual-id-value" title={valorTabela((v as any).codigo_autorizacao)}>{valorTabela((v as any).codigo_autorizacao)}</span></td></tr>)}{manualErp.length===0&&<tr><td colSpan={10}>Nenhuma venda ERP pendente encontrada para os filtros selecionados.</td></tr>}</tbody></table></div>
+            <div className="manual-table-wrap"><table><thead><tr><th></th><th className="coluna-limitavel" style={estiloLarguraColuna(LARGURAS_COLUNAS.conciliacoes.loja)} title="Loja"><span className="coluna-header-texto">Loja</span></th><th className="coluna-limitavel" style={estiloLarguraColuna(LARGURAS_COLUNAS.conciliacoes.data_venda)} title="Data venda"><span className="coluna-header-texto">Data venda</span></th><th className="coluna-limitavel" style={estiloLarguraColuna(LARGURAS_COLUNAS.conciliacoes.hora)} title="Hora"><span className="coluna-header-texto">Hora</span></th><th className="coluna-limitavel" style={estiloLarguraColuna(LARGURAS_COLUNAS.conciliacoes.valor_bruto)} title="Valor bruto"><span className="coluna-header-texto">VALOR BRUTO</span></th><th className="coluna-limitavel" style={estiloLarguraColuna(LARGURAS_COLUNAS.conciliacoes.valor_bruto)} title="Valor líquido"><span className="coluna-header-texto">VALOR LÍQUIDO</span></th><th className="coluna-limitavel" style={estiloLarguraColuna(LARGURAS_COLUNAS.conciliacoes.modalidade)} title="Modalidade"><span className="coluna-header-texto">Modalidade</span></th><th className="coluna-limitavel" style={estiloLarguraColuna(LARGURAS_COLUNAS.conciliacoes.bandeira)} title="Bandeira"><span className="coluna-header-texto">Bandeira</span></th><th className="coluna-limitavel" style={estiloLarguraColuna(LARGURAS_COLUNAS.conciliacoes.parcelas)} title="Parcelas"><span className="coluna-header-texto">Parcelas</span></th><th className="manual-id-column coluna-limitavel" style={estiloLarguraColuna(LARGURAS_COLUNAS.conciliacoes.nsu)} title="NSU"><span className="coluna-header-texto">NSU</span></th><th className="manual-id-column coluna-limitavel" style={estiloLarguraColuna(LARGURAS_COLUNAS.conciliacoes.autorizacao)} title="Autorização"><span className="coluna-header-texto">Autorização</span></th></tr></thead><tbody>{manualErp.map(v=><tr key={v.id} className={manualErpSelecionado===v.id?'manual-selected':''} onClick={()=>void selecionarVendaErp(v.id)}><td><input type="radio" checked={manualErpSelecionado===v.id} onClick={e=>e.stopPropagation()} onChange={()=>void selecionarVendaErp(v.id)}/></td><td>{estabelecimentoVenda(v)}</td><td>{dataVendaPadronizada(v)}</td><td>{horaVenda(v)}</td><td>{formatarMoedaBrasil(v.valor_bruto)}</td><td>{formatarMoedaBrasil(v.valor_liquido)}</td><td>{modalidadeErp(v)}</td><td className="coluna-limitavel manual-col-bandeira"><RenderBandeiraLogo valor={v.bandeira}/></td><td className="coluna-limitavel manual-col-parcelas"><ParcelasErp venda={v}/></td><td className="manual-id-column"><span className="manual-id-value" title={valorTabela(v.nsu)}>{valorTabela(v.nsu)}</span></td><td className="manual-id-column"><span className="manual-id-value" title={valorTabela((v as any).codigo_autorizacao)}>{valorTabela((v as any).codigo_autorizacao)}</span></td></tr>)}{manualErp.length===0&&<tr><td colSpan={11}>Nenhuma venda ERP pendente encontrada para os filtros selecionados.</td></tr>}</tbody></table></div>
             <div className="manual-pagination"><span>Exibindo {manualTotalErp===0?0:manualOffsetErp+1}–{Math.min(manualOffsetErp+manualErp.length,manualTotalErp)} de {manualTotalErp.toLocaleString('pt-BR')}</span><div><button className="secondary" disabled={manualLoading||manualOffsetErp===0} onClick={()=>carregarManual(manualBuscaErp,manualBuscaAdq,Math.max(0,manualOffsetErp-manualLimite),manualOffsetAdq)}>Anterior</button><button className="secondary" disabled={manualLoading||manualOffsetErp+manualErp.length>=manualTotalErp} onClick={()=>carregarManual(manualBuscaErp,manualBuscaAdq,manualOffsetErp+manualLimite,manualOffsetAdq)}>Próxima</button></div></div>
           </section>
           <section className="manual-side">
@@ -1620,6 +1629,7 @@ function ConciliacoesPage() {
               <span>{manualTotalAdq.toLocaleString('pt-BR')} pendente(s)</span>
             </div>
             <div className="manual-search manual-search-filters">
+              <label className="manual-status-filter" title="Somente transações AUTORIZADO podem ser conciliadas.">Status<select aria-label="Status da adquirente" value={manualStatusAdq} disabled={manualLoading} onChange={e=>{const valor=e.target.value;setManualStatusAdq(valor);setManualAdqSelecionado('');void carregarManual(manualBuscaErp,manualBuscaAdq,manualOffsetErp,0,filtros,manualErpSelecionado,valor);}}><option value="">Todos</option>{manualOpcoesStatus.map(valor=><option key={valor} value={valor}>{valor}</option>)}</select></label>
               <input value={manualBuscaAdq} onChange={e=>setManualBuscaAdq(e.target.value)} onKeyDown={e=>{if(e.key==='Enter')carregarManual(manualBuscaErp,manualBuscaAdq,manualOffsetErp,0)}} placeholder="Buscar nesta tabela: NSU, autorização ou valor"/>
               <button className="secondary" onClick={()=>carregarManual(manualBuscaErp,manualBuscaAdq,manualOffsetErp,0)} disabled={manualLoading}>Buscar</button>
             </div>
@@ -1630,7 +1640,7 @@ function ConciliacoesPage() {
         {/*<div className="manual-selection-review">
           <div className="manual-selection-card">
             <span>Venda ERP selecionada</span>
-            <strong>{manualRecebimento ? 'Recebimento de contas' : vendaErpSelecionada ? `${dataHoraVenda(vendaErpSelecionada)} · ${formatarMoedaBrasil(vendaErpSelecionada.valor_bruto)}` : 'Nenhuma'}</strong>
+            <strong>{manualRecebimento ? 'Recebimento de contas' : vendaErpSelecionada ? `${dataHoraVenda(vendaErpSelecionada)} · Bruto: ${formatarMoedaBrasil(vendaErpSelecionada.valor_bruto)} · Líquido: ${formatarMoedaBrasil(vendaErpSelecionada.valor_liquido)}` : 'Nenhuma'}</strong>
             {vendaErpSelecionada && <small>Loja {estabelecimentoVenda(vendaErpSelecionada)} · NSU {valorTabela(vendaErpSelecionada.nsu)}</small>}
           </div>
           <div className="manual-selection-arrow">↔</div>
@@ -1643,7 +1653,7 @@ function ConciliacoesPage() {
         <div className="manual-conciliacao-footer inline-footer">
           <label className={`manual-recebimento-toggle ${manualAdqSelecionado && !manualErpSelecionado ? 'enabled' : ''}`} title={manualAdqSelecionado && !manualErpSelecionado ? 'Cria um item ERP sintético Recebimento de contas usando os dados da adquirente selecionada.' : 'Selecione somente um item da adquirente para habilitar.'}><input type="checkbox" checked={manualRecebimento} disabled={!manualAdqSelecionado||!!manualErpSelecionado} onChange={e=>setManualRecebimento(e.target.checked)}/><span>Recebimento</span></label>
           <input className="manual-motivo" value={manualMotivo} onChange={e=>setManualMotivo(e.target.value)} placeholder="Motivo da conciliação manual"/>
-          <button className="manual-match-button" onClick={aplicarConciliacaoManual} disabled={manualLoading||!manualAdqSelecionado||(!manualErpSelecionado&&!manualRecebimento)||manualMotivo.trim().length<3}>{manualLoading?'Processando...':manualRecebimento?'Confirmar recebimento':'Conciliar selecionados'}</button>
+          <button className="manual-match-button" onClick={aplicarConciliacaoManual} disabled={manualLoading||!manualAdqAutorizado||!manualAdqSelecionado||(!manualErpSelecionado&&!manualRecebimento)||manualMotivo.trim().length<3}>{manualLoading?'Processando...':manualRecebimento?'Confirmar recebimento':'Conciliar selecionados'}</button>
           <div className="manual-fullscreen-trigger">
             <button
               className="secondary"
@@ -1735,7 +1745,7 @@ function ConciliacoesPage() {
                 <td>{item.venda_adquirente?<RenderAdquirenteLogo valor={item.venda_adquirente.adquirente}/>: '-'}</td>
                 <td>{dataHoraVenda(item.venda_interdata)}</td>
                 <td>{formatarMoedaBrasil(item.venda_interdata?.valor_bruto)}</td>
-                <td title={criteriosAmigaveis(item)}><div className="match-explanation compact"><strong>{comoFoiConciliado(item)}</strong></div></td>
+                <td title={criteriosAmigaveis(item)}><div className="match-explanation compact"><strong>{item.venda_adquirente?.revisao_coopcerto?.status === 'PENDENTE' ? '⚠ Revisão COOPCERTO necessária' : comoFoiConciliado(item)}</strong></div></td>
                 <td><span className={`confianca-badge confianca-${(item.confianca||'BAIXA').toLowerCase()}`}>{rotuloConfianca(item)} · {valorTabela(item.score)}</span></td>
                 <td>{formatarDataHoraConciliacao(item.data_conciliacao)}</td>
                 <td><div className="inline-actions"><button className="secondary" onClick={()=>abrirDetalhes(item.id)}>Ver detalhes</button></div></td>
@@ -1815,6 +1825,7 @@ function ConciliacoesPage() {
         {status === 'PENDENTE' && <div className="conciliacao-pendente-workspace">{/*<div className="manual-explanation"><strong>Como usar</strong><span>Selecione uma venda do ERP e a transação correspondente da adquirente. Confira os dados e clique em “Conciliar selecionados”.</span></div>*/}{renderManualWorkspace(false)}{/*<div className="manual-fullscreen-trigger"><button className="secondary" onClick={abrirConciliacaoManual}>⛶</button></div>*/}</div>}
         {status === 'SUGERIDO' && renderSugestoes()}
         {status === 'AMBIGUO' && renderAmbiguos()}
+        {Number(contadores.revisao_coopcerto || 0) > 0 && <p className="message" role="alert">Há {contadores.revisao_coopcerto} conciliação(ões) com atualização COOPCERTO pendente de revisão neste período. O vínculo histórico foi preservado; confira os itens sinalizados nos Conciliados.</p>}
         {status === 'CONCILIADO' && renderHistorico()}
       </div>
 
@@ -1823,6 +1834,7 @@ function ConciliacoesPage() {
       {detalhes && <div className="modal-backdrop" onMouseDown={()=>setDetalhes(null)}>
         <div className="conciliacao-modal" onMouseDown={e=>e.stopPropagation()}>
           <div className="modal-title"><h2>Detalhes da conciliação</h2><button className="secondary" onClick={()=>setDetalhes(null)}>Fechar</button></div>
+          {detalhes.conciliacao.venda_adquirente?.revisao_coopcerto?.status === 'PENDENTE' && <p className="message" role="alert">Revisão COOPCERTO necessária: status ou valores mudaram após o vínculo. Confira a venda da adquirente e os arquivos de origem. Uma venda cancelada exige desfazimento com justificativa.</p>}
           <div className="detalhes-grade"><div><span>Status</span><strong>{detalhes.conciliacao.status}</strong></div><div><span>Confiança</span><strong>{rotuloConfianca(detalhes.conciliacao)} · {detalhes.conciliacao.score}</strong></div><div><span>Tipo</span><strong>{tipoMatchAmigavel(detalhes.conciliacao.tipo_match)}</strong></div><div><span>Critérios</span><strong>{criteriosAmigaveis(detalhes.conciliacao)}</strong></div></div>
           {renderComparacaoDetalhada(detalhes.conciliacao)}
           <h3>Histórico de ações</h3>

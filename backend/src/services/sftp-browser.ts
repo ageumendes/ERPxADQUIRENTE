@@ -10,7 +10,7 @@ export type BrowserProvider = { key: string; nome: string; usuario: string; inDi
 export type BrowserClient = {
   list(dir: string): Promise<Array<{ name: string; type: string; size: number; modifyTime?: number }>>;
   realPath(remote: string): Promise<string>;
-  lstat(remote: string): Promise<{ isFile: boolean; isSymbolicLink: boolean }>;
+  lstat(remote: string): Promise<{ isFile: boolean; isSymbolicLink: boolean; size?: number }>;
   fastGet(remote: string, local: string): Promise<unknown>;
   end(): Promise<unknown>;
 };
@@ -80,6 +80,8 @@ export async function copySftpFile(client: BrowserClient, dir: string, name: unk
   const root = path.posix.normalize(await client.realPath(dir));
   const resolved = path.posix.normalize(await client.realPath(remote));
   if (path.posix.dirname(resolved) !== root) throw new SftpBrowserError(400, 'Arquivo fora da pasta selecionada.');
+  const maxBytes = Math.max(1, Number(process.env.UPLOAD_MAX_MB || 50)) * 1024 * 1024;
+  if(stat.size !== undefined && stat.size > maxBytes) throw new SftpBrowserError(413, 'Arquivo excede o limite configurado.');
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'erpx-sftp-copy-'));
   const local = path.join(tempDir, 'download');
   const cleanup = () => fs.rm(tempDir, { recursive: true, force: true });
@@ -88,6 +90,7 @@ export async function copySftpFile(client: BrowserClient, dir: string, name: unk
   try {
     if (signal?.aborted) throw new SftpBrowserError(499, 'Operação cancelada.');
     await client.fastGet(resolved, local);
+    if((await fs.stat(local)).size > maxBytes) throw new SftpBrowserError(413, 'Arquivo excede o limite configurado.');
     if (signal?.aborted) throw new SftpBrowserError(499, 'Operação cancelada.');
     return { local, name, cleanup };
   } catch (error) {

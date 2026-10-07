@@ -10,7 +10,7 @@ async function main(){
  } break; } catch(e:any) { if(e.code!=='ENOENT')throw e; } }
  const action=args[0];
  if(action==='simular'){
-  const fase=get('--fase','duplicidades');if(fase!=='duplicidades'&&fase!=='vouchers')throw new Error('Fase inválida.');
+  const fase=get('--fase','duplicidades');if(fase!=='duplicidades'&&fase!=='vouchers'&&fase!=='coopcerto')throw new Error('Fase inválida.');
   const p=resumoPlano(await simularCorrecao(fase,Number(get('--limite','200'))));
   const out=get('--saida',`plano-${fase}.json`);await fs.writeFile(out,JSON.stringify(p,null,2),{flag:'wx',mode:0o600});
   console.log(JSON.stringify({arquivo:out,fase,grupos:p.grupos.length,bloqueados:p.bloqueados.length,remocoes:p.remocoes,atualizacoes:p.atualizacoes},null,2));
@@ -18,6 +18,6 @@ async function main(){
   const path=get('--plano');if(!path)throw new Error('Informe --plano.');console.log(JSON.stringify(await aplicarCorrecao(JSON.parse(await fs.readFile(path,'utf8'))),null,2));
  }else if(action==='desfazer'){
   const id=get('--execucao');if(!id)throw new Error('Informe --execucao.');console.log(JSON.stringify(await desfazerCorrecao(id),null,2));
- }else throw new Error('Use simular --fase duplicidades|vouchers --saida plano.json; aplicar --plano plano.json; desfazer --execucao UUID.');
+ }else throw new Error('Use simular --fase duplicidades|vouchers|coopcerto --saida plano.json; aplicar --plano plano.json; desfazer --execucao UUID.');
 }
 main().catch(e=>{console.error(e.message);process.exitCode=1;}).finally(closePool);

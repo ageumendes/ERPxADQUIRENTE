@@ -606,7 +606,7 @@ export function RelatoriosAdquirentesPage() {
   return (
     <section className="reports-page">
       <div className="report-heading">
-        <div><h1>Relatórios financeiros</h1><p>Visão das vendas realizadas, baseada exclusivamente nos dados das adquirentes.</p></div>
+        <div><h1>Relatórios financeiros</h1><p>Totais por operação financeira. PIX com o mesmo EndToEndId em SIPAG e SICOOB é contado uma vez, pela fonte primária; o filtro de adquirente também considera essa fonte.</p></div>
         <div className="report-export-actions">
           <button className="secondary" onClick={exportarCsv} disabled={loading}><Download size={16}/> CSV</button>
           <button className="secondary" onClick={exportarExcel} disabled={loading}><FileSpreadsheet size={16}/> Excel</button>

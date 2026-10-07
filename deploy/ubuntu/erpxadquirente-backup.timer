@@ -1,0 +1,11 @@
+[Unit]
+Description=Backup diário ERPxADQUIRENTE
+
+[Timer]
+OnCalendar=*-*-* 02:30:00 America/La_Paz
+Persistent=true
+RandomizedDelaySec=300
+Unit=erpxadquirente-backup.service
+
+[Install]
+WantedBy=timers.target

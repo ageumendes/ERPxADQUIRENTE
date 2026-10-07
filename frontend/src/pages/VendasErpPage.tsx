@@ -1,7 +1,8 @@
+import { ParcelasErp } from '../components/ParcelasErp';
 import React, { useEffect, useRef, useState } from 'react';
 import { ChevronLeft, ChevronRight, Printer } from 'lucide-react';
 import { API_URL, apiFetch } from '../lib/api';
-import { COLUNAS_MOEDA, formatarMoedaBrasil, normalizarData, primeiroValor, valorTabela } from '../lib/formatters';
+import { COLUNAS_MOEDA, formatarHoraVenda, formatarMoedaBrasil, normalizarData, primeiroValor, valorTabela } from '../lib/formatters';
 import { RenderBandeiraLogo, RenderErpLogo } from '../components/PaymentLogos';
 import { FiltrosVendas, montarParamsListagemVendas, opcoesFiltrosVazias, type FiltrosListagemVendas, type OpcoesFiltrosVendas } from '../components/FiltrosVendas';
 import { useTamanhoPaginaResponsivo } from '../hooks/useTamanhoPaginaResponsivo';
@@ -13,14 +14,15 @@ import { estiloLarguraColuna, LARGURAS_COLUNAS, type LarguraColuna } from '../li
 import { abrirJanelaImpressao, imprimirTabelaAtual } from '../lib/imprimirTabela';
 import { carregarTodasVendasParaImpressao } from '../lib/impressaoVendas';
 
-type VendaErpColuna = 'erp' | 'estabelecimento' | 'data_venda' | 'hora_venda_exibicao' | 'valor_bruto' | 'tipo_produto' | 'modalidade' | 'bandeira' | 'parcelas' | 'status_venda' | 'nsu' | 'terminal' | 'status_conciliacao' | 'score_conciliacao' | 'tipo_match' | 'duplicidade_status';
+type VendaErpColuna = 'erp' | 'estabelecimento' | 'data_venda' | 'hora_venda_exibicao' | 'valor_bruto' | 'valor_liquido' | 'tipo_produto' | 'modalidade' | 'bandeira' | 'parcelas' | 'status_venda' | 'nsu' | 'terminal' | 'status_conciliacao' | 'score_conciliacao' | 'tipo_match' | 'duplicidade_status';
 
 const colunasVendasErp: { chave: VendaErpColuna; titulo: string; largura?: LarguraColuna }[] = [
   { chave: 'erp', titulo: 'ERP', largura: LARGURAS_COLUNAS.vendasErp.erp },
   { chave: 'estabelecimento', titulo: 'Loja', largura: LARGURAS_COLUNAS.vendasErp.estabelecimento },
   { chave: 'data_venda', titulo: 'Data venda', largura: LARGURAS_COLUNAS.vendasErp.data_venda },
   { chave: 'hora_venda_exibicao', titulo: 'Hora venda', largura: LARGURAS_COLUNAS.vendasErp.hora_venda_exibicao },
-  { chave: 'valor_bruto', titulo: 'Valor bruto', largura: LARGURAS_COLUNAS.vendasErp.valor_bruto },
+  { chave: 'valor_bruto', titulo: 'VALOR BRUTO', largura: LARGURAS_COLUNAS.vendasErp.valor_bruto },
+  { chave: 'valor_liquido', titulo: 'VALOR LÍQUIDO', largura: LARGURAS_COLUNAS.vendasErp.valor_bruto },
   { chave: 'tipo_produto', titulo: 'Modalidade', largura: LARGURAS_COLUNAS.vendasErp.tipo_produto },
   { chave: 'bandeira', titulo: 'Bandeira', largura: LARGURAS_COLUNAS.vendasErp.bandeira },
   { chave: 'parcelas', titulo: 'Parcelas', largura: LARGURAS_COLUNAS.vendasErp.parcelas },
@@ -30,10 +32,11 @@ const colunasVendasErp: { chave: VendaErpColuna; titulo: string; largura?: Largu
 /*console.log(colunasVendasErp)*/
 
 function exibirVenda(venda: VendaErp, coluna: VendaErpColuna) {
+  if (coluna === 'parcelas') return <ParcelasErp venda={venda}/>;
   if (coluna === 'erp') return <RenderErpLogo />;
   if (coluna === 'estabelecimento') return valorTabela(primeiroValor(venda.cnpj_estabelecimento, venda.codigo_estabelecimento));
   if (coluna === 'data_venda') return normalizarData(venda.data_venda);
-  if (coluna === 'hora_venda_exibicao') return valorTabela(venda.hora_venda);
+  if (coluna === 'hora_venda_exibicao') return formatarHoraVenda(venda.hora_venda);
   if (coluna === 'modalidade') {
     const originalPreservado = venda.forma_pagamento_original;
     const valorAtual = venda.forma_pagamento;
@@ -144,8 +147,8 @@ export function VendasErpPage() {
     if (!janela) return;
     try {
       const resultado = await carregarTodasVendasParaImpressao<VendaErp>('vendas-erp', filtros);
-      const linhas = resultado.linhas.map((v) => ['INTERDATA', valorTabela(primeiroValor(v.cnpj_estabelecimento, v.codigo_estabelecimento)), normalizarData(v.data_venda), valorTabela(v.hora_venda), formatarMoedaBrasil(v.valor_bruto), valorTabela(v.tipo_produto), valorTabela(v.bandeira), valorTabela(v.parcelas), valorTabela(v.status_conciliacao || 'PENDENTE'), valorTabela(v.nsu)]);
-      imprimirTabelaAtual('Vendas ERP - INTERDATA', ['ERP','Loja','Data venda','Hora venda','Valor bruto','Modalidade','Bandeira','Parcelas','Conciliação','NSU'], linhas, `Total de registros filtrados: ${resultado.total.toLocaleString('pt-BR')}`, [
+      const linhas = resultado.linhas.map((v) => ['INTERDATA', valorTabela(primeiroValor(v.cnpj_estabelecimento, v.codigo_estabelecimento)), normalizarData(v.data_venda), formatarHoraVenda(v.hora_venda), formatarMoedaBrasil(v.valor_bruto), formatarMoedaBrasil(v.valor_liquido), valorTabela(v.tipo_produto), valorTabela(v.bandeira), valorTabela(v.parcelas), valorTabela(v.status_conciliacao || 'PENDENTE'), valorTabela(v.nsu)]);
+      imprimirTabelaAtual('Vendas ERP - INTERDATA', ['ERP','Loja','Data venda','Hora venda','VALOR BRUTO','VALOR LÍQUIDO','Modalidade','Bandeira','Parcelas','Conciliação','NSU'], linhas, `Total de registros filtrados: ${resultado.total.toLocaleString('pt-BR')}`, [
         { rotulo: 'Período', valor: `${normalizarData(filtros.data_inicio)} a ${normalizarData(filtros.data_fim)}` }, { rotulo: 'Loja', valor: filtros.estabelecimento || 'Todos' }, { rotulo: 'F. pagamento', valor: filtros.forma_pagamento || 'Todas' }, { rotulo: 'Modalidade', valor: filtros.modalidade || 'Todas' }, { rotulo: 'Bandeira', valor: filtros.bandeira || 'Todas' }, { rotulo: 'Conciliação', valor: filtros.conciliacao || 'Todos' }, { rotulo: 'Busca', valor: filtros.busca || '—' }
       ], janela);
     } catch (error) { janela.close(); window.alert(error instanceof Error ? error.message : 'Erro ao preparar impressão.'); }

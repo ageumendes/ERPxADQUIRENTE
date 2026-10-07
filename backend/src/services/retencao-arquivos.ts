@@ -32,4 +32,5 @@ export function agendarRetencaoArquivos() {
   void executarRetencaoArquivos().catch((error) => console.error('[retencao] Falha na limpeza programada:', error));
   const timer = setInterval(() => void executarRetencaoArquivos().catch((error) => console.error('[retencao] Falha na limpeza programada:', error)), 24 * 60 * 60 * 1000);
   timer.unref();
+  return () => clearInterval(timer);
 }

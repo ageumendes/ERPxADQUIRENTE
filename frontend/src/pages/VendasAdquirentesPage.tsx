@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { ChevronLeft, ChevronRight, Printer } from 'lucide-react';
 import { API_URL, apiFetch } from '../lib/api';
-import { COLUNAS_MOEDA, COLUNAS_PERCENTUAL, formatarMoedaBrasil, normalizarData, valorTabela } from '../lib/formatters';
+import { COLUNAS_MOEDA, COLUNAS_PERCENTUAL, formatarHoraVenda, formatarLiquidoAdquirente, formatarMoedaBrasil, normalizarData, valorTabela } from '../lib/formatters';
 import { RenderAdquirenteLogo, RenderBandeiraLogo, normalizarChaveLogo } from '../components/PaymentLogos';
 import { FiltrosVendas, montarParamsListagemVendas, opcoesFiltrosVazias, type FiltrosListagemVendas, type OpcoesFiltrosVendas } from '../components/FiltrosVendas';
 import { useTamanhoPaginaResponsivo } from '../hooks/useTamanhoPaginaResponsivo';
@@ -84,8 +84,9 @@ function ordenarVendasAdquirentesPorDataHoraDesc(a: VendaAdquirente, b: VendaAdq
 }
 
 function exibirAdquirente(venda: VendaAdquirente, coluna: VendaAdquirenteColuna) {
+  if (coluna === 'valor_liquido') return formatarLiquidoAdquirente(venda);
   if (coluna === 'data_venda') return normalizarData(venda.data_venda);
-  if (coluna === 'hora_venda_exibicao') return valorTabela(venda.hora_venda);
+  if (coluna === 'hora_venda_exibicao') return formatarHoraVenda(venda.hora_venda);
   if (coluna === 'adquirente') return <RenderAdquirenteLogo valor={venda.adquirente} />;
   if (coluna === 'bandeira') return <RenderBandeiraLogo valor={venda.bandeira} />;
   if (coluna === 'status_transacao') {
@@ -184,7 +185,7 @@ export function VendasAdquirentesPage() {
     if (!janela) return;
     try {
       const resultado = await carregarTodasVendasParaImpressao<VendaAdquirente>('vendas-adquirentes', filtros);
-      const linhas = resultado.linhas.map((v) => [valorTabela(v.codigo_estabelecimento), valorTabela(v.adquirente), normalizarData(v.data_venda), valorTabela(v.hora_venda), formatarMoedaBrasil(v.valor_bruto), formatarMoedaBrasil(v.valor_taxa), formatarPercentual(v.percentual_taxa), formatarMoedaBrasil(v.valor_liquido), valorTabela(v.modalidade), valorTabela(v.bandeira), valorTabela(v.status_transacao), valorTabela(v.parcelas), valorTabela(v.status_conciliacao || 'PENDENTE'), valorTabela(v.nsu)]);
+      const linhas = resultado.linhas.map((v) => [valorTabela(v.codigo_estabelecimento), valorTabela(v.adquirente), normalizarData(v.data_venda), formatarHoraVenda(v.hora_venda), formatarMoedaBrasil(v.valor_bruto), formatarMoedaBrasil(v.valor_taxa), formatarPercentual(v.percentual_taxa), formatarLiquidoAdquirente(v), valorTabela(v.modalidade), valorTabela(v.bandeira), valorTabela(v.status_transacao), valorTabela(v.parcelas), valorTabela(v.status_conciliacao || 'PENDENTE'), valorTabela(v.nsu)]);
       imprimirTabelaAtual('Vendas Adquirentes', ['Loja','Adquirente','Data venda','Hora venda','Valor bruto','Valor taxa','%taxa','Valor líquido','Modalidade','Bandeira','Status','Parcelas','Conciliação','NSU'], linhas, `Total de registros filtrados: ${resultado.total.toLocaleString('pt-BR')}`, [
         { rotulo: 'Período', valor: `${normalizarData(filtros.data_inicio)} a ${normalizarData(filtros.data_fim)}` }, { rotulo: 'Loja', valor: filtros.estabelecimento || 'Todos' }, { rotulo: 'Adquirente', valor: filtros.adquirente || 'Todas' }, { rotulo: 'F. pagamento', valor: filtros.forma_pagamento || 'Todas' }, { rotulo: 'Modalidade', valor: filtros.modalidade || 'Todas' }, { rotulo: 'Bandeira', valor: filtros.bandeira || 'Todas' }, { rotulo: 'Status', valor: filtros.status || 'Todos' }, { rotulo: 'Conciliação', valor: filtros.conciliacao || 'Todos' }, { rotulo: 'Busca', valor: filtros.busca || '—' }
       ], janela);

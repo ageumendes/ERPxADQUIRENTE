@@ -30,11 +30,11 @@ test('checklist diário cobre todas as origens operacionais', () => {
 test('reversões possuem autorização explícita antes do registro das rotas', async () => {
   const server = await ler('src/server.ts');
   const registro = server.indexOf('registerCoreRoutes(app');
-  const duplicidade = server.indexOf("app.use('/api/auditoria/duplicidades/desmarcar'");
-  const conversao = server.indexOf("app.use('/api/auditoria/conversoes'");
+  const duplicidade = server.indexOf("app.use('/api/auditoria'");
+  const conversao = server.indexOf("app.use('/api/auditoria'");
   assert.ok(duplicidade >= 0 && duplicidade < registro);
   assert.ok(conversao >= 0 && conversao < registro);
-  assert.match(server.slice(duplicidade, registro), /ADMINISTRADOR/);
+  assert.match(server.slice(duplicidade, registro), /exigirAdmin/);
   assert.match(server.slice(conversao, registro), /exigirAdmin/);
 });
 

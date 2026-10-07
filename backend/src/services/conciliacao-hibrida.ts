@@ -124,7 +124,16 @@ function criterioBandeira(erp: VendaCandidata, adq: VendaCandidata) {
   return [e === a ? 'Bandeira igual' : `Bandeira divergente (${e} × ${a})`];
 }
 
+export function parcelaSipagSemAgrupamento(adq:Record<string,unknown>,erp:Record<string,unknown>) {
+  const parcela=String(erp.parcelas||'').trim().match(/^(\d+)\s*\/\s*(\d+)$/);
+  return normalizarTexto(adq.adquirente)==='SIPAG'&&normalizarModalidade(adq.modalidade)==='CREDITO'
+    && Boolean(parcela&&Number(parcela[2])>1)&&erp.origem_erp!=='AGRUPAMENTO_PARCELAS_SIPAG';
+}
+
 export function avaliarCandidatoHibrido(adq: VendaCandidata, erp: VendaCandidata): AvaliacaoHibrida | null {
+  if ((adq.revisao_coopcerto as {status?:string}|undefined)?.status === 'PENDENTE'
+    || (erp.revisao_coopcerto as {status?:string}|undefined)?.status === 'PENDENTE') return null;
+  if (parcelaSipagSemAgrupamento(adq,erp)) return null;
   const estabelecimentoAdq = normalizarTexto(adq.codigo_estabelecimento || adq.cnpj_estabelecimento).replace(/[^A-Z0-9]/g, '');
   const estabelecimentoErp = normalizarTexto(erp.cnpj_estabelecimento || erp.codigo_estabelecimento).replace(/[^A-Z0-9]/g, '');
   if (!estabelecimentoAdq || !estabelecimentoErp || estabelecimentoAdq !== estabelecimentoErp) return null;

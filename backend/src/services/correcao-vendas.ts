@@ -1,3 +1,4 @@
+import {chaveSemanticaCoopcerto,planejarAtualizacoesCoopcerto} from './coopcerto-upsert.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { getPool } from '../database/pool.js';
 import { chaveVenda, centavosVenda, lojaVenda, parcelasVenda, textoVenda } from './identidade-venda.js';
@@ -5,7 +6,7 @@ import { selecionarParesVoucher, capturaVoucher, economicaVoucher } from './vouc
 import type { VendaAdquirente } from '../repositories/repositorio.js';
 type Registro=Record<string,any>;
 type Alteracao={id:string;antes:Registro;depois:Registro|null};
-export type PlanoCorrecao={versao:1;assinatura:string;limite:number;fase:'duplicidades'|'vouchers';grupos:Registro[];bloqueados:Registro[];alteracoes:Alteracao[];conciliacoes:Alteracao[]};
+export type PlanoCorrecao={versao:1;assinatura:string;limite:number;fase:'duplicidades'|'vouchers'|'coopcerto';grupos:Registro[];bloqueados:Registro[];alteracoes:Alteracao[];conciliacoes:Alteracao[]};
 const stable=(x:any):string => JSON.stringify(x,(_k,v)=>v&&typeof v==='object'&&!Array.isArray(v)?Object.fromEntries(Object.keys(v).sort().map(k=>[k,v[k]])):v);
 const igual=(a:any,b:any)=>stable(a)===stable(b);
 function assinatura(v:Registro[],c:Registro[]){const hash=createHash('sha256');for(const r of [...v,...c].sort((a,b)=>String(a.row_id).localeCompare(String(b.row_id))))hash.update(stable(r));return hash.digest('hex');}
@@ -19,14 +20,36 @@ function financeira(grupo:Registro[]):{fonte?:Registro;erro?:string}{
  return {fonte:fontes.slice().sort((a,b)=>String(a.id).localeCompare(String(b.id)))[0]};
 }
 /** Pure planner: caller supplies physical columns and every conciliation, including suggestions. */
-export function planejarCorrecao(vendas:Registro[],concs:Registro[],fase:'duplicidades'|'vouchers'='duplicidades',limite=200):PlanoCorrecao {
+export function planejarCorrecao(vendas:Registro[],concs:Registro[],fase:'duplicidades'|'vouchers'|'coopcerto'='duplicidades',limite=200):PlanoCorrecao {
  if(!Number.isInteger(limite)||limite<1||limite>1000)throw new Error('Limite deve estar entre 1 e 1000 grupos.');
  const p:PlanoCorrecao={versao:1,assinatura:assinatura(vendas,concs),limite,fase,grupos:[],bloqueados:[],alteracoes:[],conciliacoes:[]};
  const byId=new Map(vendas.map(r=>[r.row_id,r]));
  const refs=new Set<string>();for(const c of concs)if(c.venda_adquirente_id)refs.add(c.venda_adquirente_id);
  for(const r of vendas)if(r.dados.vinculo_voucher_id)refs.add(r.dados.vinculo_voucher_id);
  const data=vendas.map(r=>({...r.dados,id:r.row_id,conciliacao_id:r.conciliacao_id||r.dados.conciliacao_id||''}));
- if(fase==='duplicidades'){
+ if(fase==='coopcerto') {
+  const grupos=new Map<string,Registro[]>();
+  for(const v of data) {
+   if(v.utilidade_status==='NAO_UTIL'||v.suprimido_por_vinculo_voucher)continue;
+   const key=chaveSemanticaCoopcerto(v as VendaAdquirente);if(!key)continue;
+   const lista=grupos.get(key)||[];lista.push(v);grupos.set(key,lista);
+  }
+  for(const [chave,g] of [...grupos].sort(([a],[b])=>a.localeCompare(b))) {
+   if(g.length<2)continue;
+   const autorizadas=g.filter(v=>/AUTORIZ|PROCESSAD|APROVAD/.test(textoVenda(v.status_transacao))&&!/NAO AUTORIZ/.test(textoVenda(v.status_transacao)));
+   const financeiras=new Set(autorizadas.map(v=>JSON.stringify([centavosVenda(v.valor_taxa),centavosVenda(v.valor_liquido)])));
+   if(financeiras.size>1) {p.bloqueados.push({ids:g.map(v=>v.id),motivo:'FONTES_FINANCEIRAS_DIVERGENTES'});continue;}
+   const existentes=g.slice().sort((a,b)=>a.id.localeCompare(b.id)).map(v=>({row_id:v.id,dados:v as VendaAdquirente,referenciado:refs.has(v.id)}));
+   const plano=planejarAtualizacoesCoopcerto(existentes,[existentes[0].dados]);
+   if(plano.conflitos) {p.bloqueados.push({ids:g.map(v=>v.id),motivo:'IDENTIDADE_DIVERGENTE_OU_MULTIPLOS_VINCULOS'});continue;}
+   if(!plano.substituidos.size||p.grupos.length>=limite)continue;
+   const manter=[...plano.substituidos.values()][0];
+   const atualizado=plano.updates.get(manter)||byId.get(manter)!.dados;
+   p.grupos.push({chave,manter,substituir:[...plano.substituidos.keys()],status:atualizado.status_transacao,valor_bruto:atualizado.valor_bruto,valor_taxa:atualizado.valor_taxa,valor_liquido:atualizado.valor_liquido});
+   if(plano.updates.has(manter))p.alteracoes.push({id:manter,antes:byId.get(manter)!,depois:atualizado});
+   for(const [id,principal] of plano.substituidos)p.alteracoes.push({id,antes:byId.get(id)!,depois:{...byId.get(id)!.dados,utilidade_status:'NAO_UTIL',utilidade_motivo:'COOPCERTO_ATUALIZACAO_SUBSTITUIDA',coopcerto_substituida_por_id:principal}});
+  }
+ }else if(fase==='duplicidades'){
   const grupos=new Map<string,Registro[]>();
   for(const v of data){if(v.suprimido_por_vinculo_voucher===true||v.suprimido_por_vinculo_voucher==='true')continue;const k=chaveVenda(v);if(k){const g=grupos.get(k)||[];g.push(v);grupos.set(k,g);}}
   for(const [chave,g] of [...grupos].sort(([a],[b])=>a.localeCompare(b))){
@@ -67,7 +90,7 @@ export function planejarCorrecao(vendas:Registro[],concs:Registro[],fase:'duplic
  return p;
 }
 async function snapshot(q:{query:Function}){const v=await q.query('SELECT * FROM vendas_adquirentes ORDER BY row_id');const c=await q.query('SELECT * FROM conciliacoes ORDER BY row_id');return {v:v.rows,c:c.rows};}
-export async function simularCorrecao(fase:'duplicidades'|'vouchers'='duplicidades',limite=200){
+export async function simularCorrecao(fase:'duplicidades'|'vouchers'|'coopcerto'='duplicidades',limite=200){
  const client=await getPool().connect();try{await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');const {v,c}=await snapshot(client);const p=planejarCorrecao(v,c,fase,limite);await client.query('COMMIT');return p;}catch(e){await client.query('ROLLBACK');throw e;}finally{client.release();}
 }
 export function resumoPlano(p:PlanoCorrecao){return {versao:p.versao,assinatura:p.assinatura,fase:p.fase,limite:p.limite,grupos:p.grupos,bloqueados:p.bloqueados,remocoes:p.alteracoes.filter(a=>!a.depois).length,atualizacoes:p.alteracoes.filter(a=>a.depois).length};}

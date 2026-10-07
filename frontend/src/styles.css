@@ -219,33 +219,7 @@ button.secondary:hover:not(:disabled) { background: #303030; }
 .conversion-report-status.aplicada { color: #166534; background: #dcfce7; }
 .conversion-report-status.sem_correspondencia { color: #854d0e; background: #fef9c3; }
 .conversion-report-status.erro { color: #991b1b; background: #fee2e2; }
-.bin-catalog-launcher { display: flex; align-items: center; gap: 14px; margin: 14px 0; padding: 10px 14px; border: 1px solid var(--border); border-radius: 14px; background: var(--card-2); }
-.bin-catalog-launcher > div:first-child { min-width: 250px; }
-.bin-catalog-launcher h3 { margin: 0 0 2px; }
-.bin-catalog-launcher p { margin: 0; font-size: .78rem; }
-.bin-catalog-launcher .bin-summary { margin-left: auto; }
-.bin-catalog-overlay { position: fixed; inset: 0; z-index: 3000; display: flex; align-items: center; justify-content: center; padding: clamp(12px, 3vw, 40px); background: rgba(0,0,0,.76); backdrop-filter: blur(3px); }
-.bin-catalog-modal { width: min(1500px, 96vw); height: min(820px, 90vh); min-height: 0; display: grid; grid-template-rows: auto auto minmax(0, 1fr); gap: 14px; padding: 18px; border: 1px solid #353535; border-radius: 18px; background: linear-gradient(180deg, #171717 0%, #0c0c0c 100%); box-shadow: 0 28px 90px rgba(0,0,0,.72); overflow: hidden; }
-.bin-catalog-modal-header { display: flex; align-items: flex-start; gap: 18px; }
-.bin-catalog-modal-header > div:first-child { flex: 1; min-width: 260px; }
-.bin-catalog-modal-header h2 { margin: 0 0 4px; }
-.bin-catalog-modal-header p { margin: 0; }
-.bin-catalog-modal-header .icon-only { flex: 0 0 auto; }
-.bin-summary, .bin-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-.bin-summary span { padding: 6px 9px; border: 1px solid var(--border); border-radius: 999px; font-size: .76rem; font-weight: 800; white-space: nowrap; }
 .warning-text { color: #b45309; }
-.bin-filters input { min-width: 220px; }
-.bin-catalog-table { min-height: 0; height: 100%; max-height: none; overflow: auto; }
-.bin-catalog-table thead th { position: sticky; top: 0; z-index: 2; }
-.bin-catalog-table input { min-width: 145px; }
-.bin-catalog-table button { white-space: nowrap; }
-@media (max-width: 900px) {
-  .bin-catalog-launcher, .bin-catalog-modal-header { flex-wrap: wrap; }
-  .bin-catalog-launcher .bin-summary { width: 100%; margin-left: 0; }
-  .bin-catalog-overlay { padding: 0; }
-  .bin-catalog-modal { width: 100vw; height: 100vh; max-height: none; border: 0; border-radius: 0; padding: 12px; }
-  .bin-catalog-modal-header .bin-summary { order: 3; width: 100%; }
-}
 .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 16px; padding: 0px 40px; }
 .imports-table-wrap { overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; }
 .imports-table-wrap thead th { position: sticky; top: 0; z-index: 2; }
@@ -1449,6 +1423,7 @@ ul { margin: 0; padding-left: 20px; color: var(--muted); line-height: 1.8; }
 .venda-conciliacao-botao { display: inline-flex; width: 100%; align-items: center; justify-content: center; padding: 2px; border: 0; background: transparent; cursor: pointer; }
 .venda-conciliacao-botao.sim { color: #00aa14; }
 .venda-conciliacao-botao.nao { color: #dc3232; }
+.venda-conciliacao-botao.revisao { color: #b77900; }
 .venda-conciliacao-botao:hover { filter: brightness(1.25); }
 .venda-comparacao-modal { width: min(920px, calc(100vw - 32px)); max-height: 90vh; overflow-y: auto; }
 .venda-comparacao-scroll { overflow-x: auto; }
@@ -1647,3 +1622,18 @@ ul { margin: 0; padding-left: 20px; color: var(--muted); line-height: 1.8; }
   overflow-y: auto;
   overscroll-behavior: contain;
 }
+
+.manual-search .manual-status-filter{display:flex;align-items:center;gap:6px;flex:0 0 auto;font-size:11px;color:var(--muted)}
+.manual-status-filter select{min-height:34px;max-width:180px;padding:6px 8px}
+
+/* Portal independente das tabelas e das sobreposições de conciliação. */
+.erp-parcelas-botao { cursor:pointer; white-space:nowrap; color:var(--primary); background:transparent; border:0; padding:4px; text-decoration:underline; font:inherit; }
+.erp-parcelas-overlay { position:fixed; inset:0; z-index:5000; display:grid; place-items:center; padding:16px; background:#000b; overflow:auto; overscroll-behavior:contain; }
+.erp-parcelas-modal { width:min(640px,100%); max-height:85vh; overflow:auto; background:var(--card,#171717); color:var(--text,#eee); border:1px solid #444; border-radius:12px; padding:20px; box-shadow:0 20px 60px #0008; }
+.erp-parcelas-modal header { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+.erp-parcelas-modal h2 { margin:0; font-size:18px; }
+.erp-parcelas-modal p { color:var(--muted); }
+.erp-parcelas-scroll { overflow:auto; }
+.erp-parcelas-modal table { width:100%; min-width:360px; }
+.erp-parcelas-modal th,.erp-parcelas-modal td { padding:12px 10px; white-space:nowrap; }
+.erp-parcelas-modal tfoot { font-weight:700; }

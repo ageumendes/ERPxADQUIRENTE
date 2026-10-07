@@ -1,3 +1,4 @@
+import { validarSegredo } from '../config/producao.js';
 import { resolveSftpFolder, validateSftpFilename, withSftpBrowser, listSftpFolder, copySftpFile, SftpBrowserError } from './sftp-browser.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -58,7 +59,7 @@ const db = getPool;
 
 function chaveCriptografia(segredoInformado?: string) {
   const segredo = String(segredoInformado || process.env.SFTP_ENCRYPTION_KEY || '');
-  if (segredo.length < 32 || segredo.startsWith('SUBSTITUA_')) throw new Error('SFTP_ENCRYPTION_KEY deve ser configurada com um segredo real de pelo menos 32 caracteres.');
+  validarSegredo('SFTP_ENCRYPTION_KEY', segredo);
   return createHash('sha256').update(segredo).digest();
 }
 function criptografar(valor: string) { const iv=randomBytes(12),cipher=createCipheriv('aes-256-gcm',chaveCriptografia(),iv);const data=Buffer.concat([cipher.update(valor,'utf8'),cipher.final()]);return [iv.toString('base64'),cipher.getAuthTag().toString('base64'),data.toString('base64')].join('.'); }
@@ -289,7 +290,10 @@ async function coletarProvider(provider: RemoteProviderConfig, options: PullOpti
       const caminhoLocal = path.join(providerPulledDir, `${Date.now()}-${item.name}`);
 
       try {
+        const maxBytes = Math.max(1, Number(process.env.UPLOAD_MAX_MB || 50)) * 1024 * 1024;
+        if(item.size > maxBytes) throw new Error('Arquivo SFTP excede UPLOAD_MAX_MB.');
         await client.fastGet(remoto, caminhoLocal);
+        if((await fs.stat(caminhoLocal)).size > maxBytes) throw new Error('Arquivo SFTP excede UPLOAD_MAX_MB após download.');
         const registro = await registrarArquivoBaixado({ provider, caminhoLocal, nomeOriginal: item.name, processarArquivoLocal });
         resultado.arquivos.push(registro);
         if (registro.acao === 'BAIXADO_IMPORTADO' || registro.acao === 'DUPLICADO') {
@@ -305,7 +309,8 @@ async function coletarProvider(provider: RemoteProviderConfig, options: PullOpti
             if (registro.hash_arquivo) {
               const importacaoConfirmada = await buscarImportacaoPorHash(registro.hash_arquivo);
               const caminhoImportado = String(importacaoConfirmada?.caminho_arquivo || '');
-              if (caminhoImportado) await fs.unlink(caminhoImportado).catch(() => undefined);
+              // Preserva o original em processados para auditoria e backup local.
+              void caminhoImportado;
             }
           }
         }

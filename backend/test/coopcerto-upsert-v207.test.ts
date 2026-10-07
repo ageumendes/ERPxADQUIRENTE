@@ -77,6 +77,7 @@ test('pendente vira autorizada no mesmo ID e conserva a conciliação', () => {
   assert.equal(atualizada.importacao_id, 'imp-pendente');
   assert.equal(atualizada.conciliacao_id, 'conc-1');
   assert.equal(atualizada.status_conciliacao, 'CONCILIADO');
+  assert.equal((atualizada as any).revisao_coopcerto.status, 'PENDENTE', 'alteração de valores após vínculo exige revisão');
   assert.equal(atualizada.status_transacao, 'AUTORIZADO');
   assert.equal(atualizada.nsu, '3922577721');
   assert.equal(atualizada.valor_taxa, '6.46');

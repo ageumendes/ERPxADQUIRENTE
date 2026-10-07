@@ -12,7 +12,7 @@ test('NÃO APLICA é uma lista negra lógica aplicada às listagens e conciliaç
   assert.match(repositorio, /construirWhereListagem[\s\S]*sqlRegistroNaoAplicavel\(config\.tabela\)/);
   assert.match(repositorio, /listarConciliacoesComExibicao[\s\S]*sqlRegistroNaoAplicavel\('vendas_interdata','e'\)/);
   assert.match(repositorio, /executarConciliacaoHibridaPostgres[\s\S]*sqlRegistroNaoAplicavel\('vendas_adquirentes','a'\)/);
-  assert.match(repositorio, /Conciliação bloqueada: o estabelecimento está marcado como NÃO APLICA/);
+  assert.match(repositorio, /validarParConciliacao/);
 });
 
 test('SQL híbrido exige estabelecimento preenchido e igual antes dos demais critérios', () => {

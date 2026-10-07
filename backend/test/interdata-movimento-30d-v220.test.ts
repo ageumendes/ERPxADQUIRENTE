@@ -22,4 +22,7 @@ test('hash do movimento é estável entre importações e independe da posição
   assert.equal(a?.[0].cnpj_estabelecimento, '27752608000129');
   assert.equal(a?.[0].data_venda, '27/08/2026');
   assert.equal(a?.[0].hora_venda, '06:45:44');
+  assert.equal(a?.[0].valor_bruto, '22.19');
+  assert.equal(a?.[0].valor_liquido, '21.94591');
+  assert.equal(a?.[0].dados_originais['Vlr. Liquido'], '21.94591');
 });

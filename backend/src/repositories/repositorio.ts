@@ -1,8 +1,10 @@
+import { sincronizarAgrupamentosSipagTx, validarAgrupamentoSipagTx, atualizarParcelasGrupoTx } from '../services/erp-parcelas-sipag.js';
+import { sincronizarVinculosPixSipagSicoobTx, validarElegibilidadeConciliacao, validarParConciliacao, PIX_FINANCEIRO_SQL } from '../services/pix-vinculos.js';
 import { ehSipagComplementar, planejarSipagComplementares, sipagChaveComplementar, sipagData } from '../services/sipag-complementacao.js';
-import { ehVendaCoopcertoCabal, planejarAtualizacoesCoopcerto } from '../services/coopcerto-upsert.js';
+import { ehVendaCoopcertoCabal, estadoCoopcerto, chaveSemanticaCoopcerto, planejarAtualizacoesCoopcerto } from '../services/coopcerto-upsert.js';
 import { chaveVenda, centavosVenda } from '../services/identidade-venda.js';
 import { simularCorrecao, aplicarCorrecao, resumoPlano } from '../services/correcao-vendas.js';
-import { capturaVoucher, economicaVoucher, selecionarParesVoucher, redeEsperadaVoucher, identificadorVoucher } from '../services/voucher-pares.js';
+import { capturaVoucher, redeCapturaVoucher, economicaVoucher, selecionarParesVoucher, redeEsperadaVoucher, identificadorVoucher } from '../services/voucher-pares.js';
 import {
   importacoesTabela,
   vendasErpTabela,
@@ -205,7 +207,7 @@ async function garantirTabelaPostgres(nomeTabela: string) {
 
 async function removerTabelaLinhasImportadasLegadaPostgres() {
   const prisma = await getDatabase();
-  await prisma.$executeRawUnsafe('DROP TABLE IF EXISTS "linhas_importadas"');
+  // Dados legados preservados. A tabela não integra as consultas operacionais.
   nomesTabelasGarantidas.delete('linhas_importadas');
 }
 
@@ -229,64 +231,6 @@ async function garantirDbPostgres() {
 
 export async function prepararConsultasOtimizadas() {
   await garantirDbPostgres();
-}
-
-async function sincronizarVinculosPixSipagSicoobTx(tx: any) {
-  // v0.1.241: SIPAG PIX e SICOOB PIX com o mesmo EndToEndId representam a
-  // mesma operação financeira. Os dois registros permanecem intactos; somente
-  // um fica elegível à conciliação. Se um deles já está conciliado, preserva-se
-  // esse vínculo. Sem vínculo prévio, SICOOB é a fonte primária.
-  await tx.$executeRawUnsafe(`WITH base AS (
-    SELECT row_id, conciliacao_id, dados,
-           UPPER(TRIM(COALESCE(dados->>'adquirente',''))) AS adquirente,
-           UPPER(TRIM(COALESCE(dados->>'modalidade',''))) AS modalidade,
-           TRIM(COALESCE(NULLIF(dados->>'nsu',''), NULLIF(dados->'dados_json'->>'end_to_end_id',''), NULLIF(dados->'dados_json'->>'endToEndId',''))) AS e2e
-      FROM vendas_adquirentes
-     WHERE UPPER(TRIM(COALESCE(dados->>'modalidade','')))='PIX'
-       AND UPPER(TRIM(COALESCE(dados->>'adquirente',''))) IN ('SIPAG','SICOOB')
-  ), pares AS (
-    SELECT s.row_id AS sipag_id, c.row_id AS sicoob_id, s.e2e,
-           s.conciliacao_id AS sipag_conciliacao_id, c.conciliacao_id AS sicoob_conciliacao_id,
-           CASE
-             WHEN s.conciliacao_id IS NOT NULL AND c.conciliacao_id IS NOT NULL THEN 'CONFLITO'
-             WHEN s.conciliacao_id IS NOT NULL THEN 'SIPAG'
-             ELSE 'SICOOB'
-           END AS primaria
-      FROM base s
-      JOIN base c ON c.adquirente='SICOOB' AND s.adquirente='SIPAG' AND c.e2e=s.e2e
-     WHERE s.e2e<>''
-  ), patches AS (
-    SELECT sipag_id AS row_id,
-           jsonb_build_object(
-             'pix_operacao_compartilhada','SIM', 'pix_end_to_end_id',e2e,
-             'pix_fonte_par','SICOOB', 'pix_registro_par_id',sicoob_id,
-             'pix_vinculo_criterio','END_TO_END_ID_EXATO',
-             'pix_fonte_primaria',CASE WHEN primaria='CONFLITO' THEN '' ELSE primaria END,
-             'pix_redundante',CASE WHEN primaria='SICOOB' THEN 'SIM' ELSE 'NAO' END,
-             'pix_vinculo_conflito',CASE WHEN primaria='CONFLITO' THEN 'AMBOS_CONCILIADOS' ELSE '' END
-           ) AS patch
-      FROM pares
-    UNION ALL
-    SELECT sicoob_id AS row_id,
-           jsonb_build_object(
-             'pix_operacao_compartilhada','SIM', 'pix_end_to_end_id',e2e,
-             'pix_fonte_par','SIPAG', 'pix_registro_par_id',sipag_id,
-             'pix_vinculo_criterio','END_TO_END_ID_EXATO',
-             'pix_fonte_primaria',CASE WHEN primaria='CONFLITO' THEN '' ELSE primaria END,
-             'pix_redundante',CASE WHEN primaria='SIPAG' THEN 'SIM' ELSE 'NAO' END,
-             'pix_vinculo_conflito',CASE WHEN primaria='CONFLITO' THEN 'AMBOS_CONCILIADOS' ELSE '' END
-           ) AS patch
-      FROM pares
-  )
-  UPDATE vendas_adquirentes v
-     SET dados=v.dados || patches.patch, data_atualizacao=NOW()
-    FROM patches
-   WHERE v.row_id=patches.row_id
-     AND (v.dados->>'pix_operacao_compartilhada' IS DISTINCT FROM patches.patch->>'pix_operacao_compartilhada'
-       OR v.dados->>'pix_registro_par_id' IS DISTINCT FROM patches.patch->>'pix_registro_par_id'
-       OR v.dados->>'pix_fonte_primaria' IS DISTINCT FROM patches.patch->>'pix_fonte_primaria'
-       OR v.dados->>'pix_redundante' IS DISTINCT FROM patches.patch->>'pix_redundante'
-       OR v.dados->>'pix_vinculo_conflito' IS DISTINCT FROM patches.patch->>'pix_vinculo_conflito')`);
 }
 
 async function garantirRelacionamentosConciliacaoPostgres() {
@@ -378,6 +322,7 @@ async function garantirRelacionamentosConciliacaoPostgres() {
        AND COALESCE(NULLIF(c.status,''),c.dados->>'status')='CONCILIADO'
        AND NOT EXISTS (SELECT 1 FROM "vendas_interdata" outra WHERE outra.conciliacao_id=candidatos.id)`);
 
+    await tx.$executeRawUnsafe(`CREATE INDEX IF NOT EXISTS idx_pix_e2e_fontes ON vendas_adquirentes ((TRIM(COALESCE(NULLIF(dados->'dados_json'->>'end_to_end_id',''),NULLIF(dados->'dados_json'->>'endToEndId',''),NULLIF(dados->>'end_to_end_id',''),dados->>'nsu','')))) WHERE UPPER(TRIM(COALESCE(dados->>'modalidade','')))='PIX'`);
     // Só depois de restaurar vínculos históricos decide qual fonte PIX é primária.
     await sincronizarVinculosPixSipagSicoobTx(tx);
 
@@ -419,7 +364,7 @@ async function lerTabelaPostgres<T>(arquivo: string, fallback: T): Promise<T> {
   const tabela = nomeTabelaSeguro(nomeTabela);
   const prisma = await getDatabase();
   const rows = await (prisma.$queryRawUnsafe(`SELECT dados FROM ${tabela} ORDER BY pk ASC`) as Promise<Array<{ dados: unknown }>>);
-  return rows.map((row: { dados: unknown }) => row.dados) as T;
+  return rows.map((row: { dados: unknown }) => row.dados).filter((d:any)=>nomeTabela!=='vendas_interdata'||(!d.agrupamento_erp_id&&!d.agrupamento_inativo)) as T;
 }
 
 async function gravarTabelaPostgres<T>(arquivo: string, data: T): Promise<void> {
@@ -452,8 +397,12 @@ async function gravarTabelaPostgres<T>(arquivo: string, data: T): Promise<void> 
         ...valores,
       );
     }
-    if (rowIds.length === 0) await tx.$executeRawUnsafe(`DELETE FROM ${tabela}`);
-    else await tx.$executeRawUnsafe(`DELETE FROM ${tabela} WHERE NOT (row_id = ANY($1::text[]))`, rowIds);
+    // Parcelas e grupos históricos ficam fora da leitura operacional, mas nunca
+    // podem ser apagados por uma regravação dessa lista filtrada.
+    const preservarAgrupadas = nomeTabela === 'vendas_interdata'
+      ? ` AND COALESCE(dados->>'agrupamento_erp_id','')='' AND COALESCE(dados->>'agrupamento_inativo','false')<>'true'` : '';
+    if (rowIds.length === 0) await tx.$executeRawUnsafe(`DELETE FROM ${tabela} WHERE TRUE${preservarAgrupadas}`);
+    else await tx.$executeRawUnsafe(`DELETE FROM ${tabela} WHERE NOT (row_id = ANY($1::text[]))${preservarAgrupadas}`, rowIds);
   });
 }
 
@@ -467,6 +416,7 @@ async function appendTabelaPostgres<T extends Record<string, unknown>>(arquivo: 
   let duplicados = 0;
   const prisma = await getDatabase();
   await prisma.$transaction(async (tx: any) => {
+    if (nomeTabela === 'vendas_interdata' || nomeTabela === 'vendas_adquirentes') await tx.$executeRawUnsafe('SELECT pg_advisory_xact_lock(247,1)');
     for (let inicio = 0; inicio < registrosNovos.length; inicio += 250) {
       const lote = registrosNovos.slice(inicio, inicio + 250);
       const valores: unknown[] = [];
@@ -495,6 +445,7 @@ export type VendaErp = {
   terminal?: string;
   nsu?: string;
   valor_bruto?: string;
+  valor_liquido?: string;
   forma_pagamento?: string;
   bandeira?: string;
   tipo_produto?: string;
@@ -2136,17 +2087,26 @@ async function salvarVendasCoopcertoPostgres(vendas: VendaAdquirente[]): Promise
   return db.$transaction(async (tx) => {
     // Serializa somente as vendas COOPCERTO. Dois arquivos dos últimos 30 dias
     // não podem observar a mesma chave como ausente e inserir duas cópias.
+    await tx.$executeRawUnsafe('SELECT pg_advisory_xact_lock(247,1)');
     await tx.$queryRawUnsafe('SELECT pg_advisory_xact_lock(207, 155)');
-    const chaves = [...new Set(vendas.map((venda) => String(venda.chave_semantica_coopcerto || (venda.dados_json as any)?.chave_semantica_coopcerto || '')).filter(Boolean))];
+    // Compartilha a exclusão com confirmação/desfazimento e o motor automático.
+    await tx.$queryRawUnsafe('SELECT pg_advisory_xact_lock(242, 1)');
+    const chaves = [...new Set(vendas.map(chaveSemanticaCoopcerto).filter(Boolean))];
+    const rrns=[...new Set(vendas.map(v=>String(v.dados_json?.id_venda_rrn||v.dados_json?.['ID Venda']||v.dados_json?.id_venda||'').trim().toUpperCase()).filter(Boolean))];
     const existentes = chaves.length ? await tx.$queryRawUnsafe(`
-      SELECT row_id, dados
-        FROM vendas_adquirentes
+      SELECT v.row_id, v.dados, v.conciliacao_id,
+             EXISTS(SELECT 1 FROM conciliacoes c WHERE c.venda_adquirente_id=v.row_id) AS referenciado
+        FROM vendas_adquirentes v
        WHERE UPPER(COALESCE(dados->>'adquirente',''))='COOPCERTO'
          AND UPPER(COALESCE(dados->>'utilidade_status','UTIL')) <> 'NAO_UTIL'
-         AND COALESCE(NULLIF(dados->>'chave_semantica_coopcerto',''), dados->'dados_json'->>'chave_semantica_coopcerto','') = ANY($1::text[])
-       ORDER BY pk ASC
-    `, chaves) as Array<{ row_id: string; dados: VendaAdquirente }> : [];
+         AND (COALESCE(NULLIF(dados->>'chave_semantica_coopcerto',''), dados->'dados_json'->>'chave_semantica_coopcerto','') = ANY($1::text[])
+          OR UPPER(TRIM(COALESCE(NULLIF(dados->'dados_json'->>'id_venda_rrn',''),NULLIF(dados->'dados_json'->>'ID Venda',''),dados->'dados_json'->>'id_venda',''))) = ANY($2::text[]))
+       ORDER BY pk ASC FOR UPDATE OF v
+    `, chaves, rrns) as Array<{ row_id: string; dados: VendaAdquirente; conciliacao_id?:string; referenciado?:boolean }> : [];
+    for(const r of existentes) if(r.conciliacao_id)r.dados={...r.dados,conciliacao_id:r.conciliacao_id};
 
+    // O planejador atualiza seu índice em memória; guarde a revisão anterior antes dele.
+    const revisoesAnteriores = new Map(existentes.map(r => [r.row_id, JSON.stringify((r.dados as any).revisao_coopcerto)]));
     const plano = planejarAtualizacoesCoopcerto(existentes, vendas);
     let atualizados = 0;
     for (const [rowId, dadosAtualizados] of plano.updates) {
@@ -2157,6 +2117,26 @@ async function salvarVendasCoopcertoPostgres(vendas: VendaAdquirente[]): Promise
          RETURNING pk
       `, rowId, stringifyJsonbSeguro(dadosAtualizados as any));
       atualizados += alterados.length;
+      const revisao = (dadosAtualizados as any).revisao_coopcerto;
+      if (revisao?.status === 'PENDENTE' && JSON.stringify(revisao) !== revisoesAnteriores.get(rowId)) {
+        // Preserva estado/vínculos históricos; revisão e histórico fazem parte da mesma transação.
+        const vinculadas = await tx.$queryRawUnsafe(`
+          SELECT row_id, status, venda_interdata_id FROM conciliacoes
+           WHERE venda_adquirente_id=$1 AND status <> 'DESFEITO'
+           ORDER BY row_id FOR UPDATE`, rowId) as Array<{row_id:string;status:string;venda_interdata_id:string}>;
+        for (const conc of vinculadas) {
+          const patch = stringifyJsonbSeguro({ revisao_coopcerto: revisao });
+          await tx.$executeRawUnsafe(`UPDATE conciliacoes SET dados=dados || $2::jsonb,
+            data_atualizacao=NOW() WHERE row_id=$1`, conc.row_id, patch);
+          await tx.$executeRawUnsafe(`UPDATE vendas_interdata SET dados=dados || $2::jsonb,
+            data_atualizacao=NOW() WHERE row_id=$1 AND conciliacao_id=$3`, conc.venda_interdata_id, patch, conc.row_id);
+          await tx.$executeRawUnsafe(`INSERT INTO historico_conciliacoes
+            (conciliacao_id,acao,status_anterior,status_novo,motivo,usuario_nome,detalhes)
+            VALUES($1,'ATUALIZACAO_COOPCERTO_REQUER_REVISAO',$2,$2,$3,'Importação',$4::jsonb)`,
+            conc.row_id, conc.status, 'Atualização COOPCERTO requer revisão: ' + revisao.motivos.join(', '),
+            stringifyJsonbSeguro({ venda_adquirente_id: rowId, revisao_coopcerto: revisao }));
+        }
+      }
     }
 
     for (const [rowId, principalId] of plano.substituidos) {
@@ -2349,6 +2329,7 @@ export async function normalizarVendasAdquirentesExistentes(opcoes: { modo?: 'GL
   // v0.1.150: recalcula por último, depois de TODAS as conversões, para impedir que
   // qualquer regra sobrescreva o valor matemático derivado de valor_bruto e valor_taxa.
   const percentualTaxaRecalculado = usarPostgres() ? await recalcularPercentualTaxaPostgres(idsEscopo) : 0;
+  if (usarPostgres()) await (await getDatabase()).$transaction(tx => sincronizarVinculosPixSipagSicoobTx(tx));
   const atualizados = (conversoesAplicadas.tabelas.vendas_adquirentes?.atualizados || 0) + percentualTaxaRecalculado;
   if (atualizados > 0) invalidarCachesOpcoesVendas();
   return {
@@ -2383,7 +2364,7 @@ export async function obterCoberturaCodigosEstabelecimento() {
            COUNT(*) FILTER (WHERE COALESCE(TRIM(dados->>'codigo_estabelecimento'),'')<>'')::int identificados,
            COUNT(*) FILTER (WHERE COALESCE(TRIM(dados->>'codigo_estabelecimento'),'')='')::int pendentes,
            COUNT(DISTINCT NULLIF(TRIM(dados->>'codigo_estabelecimento'),''))::int estabelecimentos
-      FROM vendas_adquirentes GROUP BY 1 ORDER BY 1
+      FROM vendas_adquirentes WHERE registro_nao_aplicavel = FALSE GROUP BY 1 ORDER BY 1
   `) as Array<{adquirente:string;total:number;identificados:number;pendentes:number;estabelecimentos:number}>;
   return {
     itens,
@@ -2556,7 +2537,8 @@ export async function gerarRelatorioAdquirentes(filtros: Record<string, unknown>
   await garantirDbPostgres();
   const db = await getDatabase();
   const config: ConfigListagemSql = { tabela: 'vendas_adquirentes', adquirente: true, estabelecimento: 'estabelecimento_filtro', modalidade: 'modalidade_filtro', status: 'status_filtro' };
-  const { where, parametros } = construirWhereListagem(filtros, config);
+  const { where: whereFontes, parametros } = construirWhereListagem(filtros, config);
+  const where = `${whereFontes || 'WHERE TRUE'} AND ${PIX_FINANCEIRO_SQL()}`;
   const dataVenda = dataVendaSql();
   const moeda = (campo: string) => `CASE WHEN REPLACE(COALESCE(dados->>'${campo}','0'), ',', '.') ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN REPLACE(dados->>'${campo}', ',', '.')::numeric ELSE 0 END`;
   const bruto = moeda('valor_bruto');
@@ -2605,6 +2587,7 @@ export async function gerarRelatorioAdquirentes(filtros: Record<string, unknown>
   const parametrosHistorico = adquirenteHistorico ? [adquirenteHistorico] : [];
   const whereHistoricoBase = `UPPER(COALESCE(dados->>'utilidade_status','UTIL')) <> 'NAO_UTIL'
     AND LOWER(COALESCE(dados->>'suprimido_por_vinculo_voucher','false')) <> 'true'
+    AND ${PIX_FINANCEIRO_SQL()}
     AND NOT (${sqlRegistroNaoAplicavel('vendas_adquirentes')})`;
   const whereHistorico = adquirenteHistorico
     ? `WHERE ${whereHistoricoBase} AND UPPER(COALESCE(NULLIF(TRIM(dados->>'adquirente'),''), 'NÃO INFORMADO')) = $1`
@@ -2730,8 +2713,10 @@ function sqlCodigoEstabelecimento(_tabela: 'vendas_adquirentes' | 'vendas_interd
   return `${alias}.estabelecimento_chave`;
 }
 
-function sqlRegistroNaoAplicavel(tabela: 'vendas_adquirentes' | 'vendas_interdata', aliasRegistro = '') {
-  if (!aliasRegistro) return `"${tabela}".registro_nao_aplicavel`;
+function sqlRegistroNaoAplicavel(tabela: 'vendas_adquirentes' | 'vendas_interdata', aliasRegistro = '', excluirParcelasAgrupadas = true) {
+  const prefixo = aliasRegistro || `"${tabela}"`;
+  const agrupada = tabela === 'vendas_interdata' && excluirParcelasAgrupadas ? ` OR COALESCE(${prefixo}.dados->>'agrupamento_erp_id','') <> '' OR COALESCE(${prefixo}.dados->>'agrupamento_inativo','false') = 'true'` : '';
+  if (!aliasRegistro) return `(${prefixo}.registro_nao_aplicavel${agrupada})`;
   const dadosRegistro = aliasRegistro ? `${aliasRegistro}.dados` : `"${tabela}".dados`;
   const valorAtualConversao = `${dadosRegistro}->>(cv.dados->>'coluna_origem')`;
   const origem = tabela === 'vendas_adquirentes'
@@ -2740,7 +2725,7 @@ function sqlRegistroNaoAplicavel(tabela: 'vendas_adquirentes' | 'vendas_interdat
   const literalNaoAplica = ['codigo_estabelecimento', 'cnpj_estabelecimento', 'pagador_cnpj', 'pagador_documento']
     .map((coluna) => `REGEXP_REPLACE(TRANSLATE(UPPER(COALESCE(${dadosRegistro}->>'${coluna}','')), 'ÁÀÂÃÉÊÍÓÔÕÚÇ', 'AAAAEEIOOOUC'), '[^A-Z0-9]', '', 'g') = 'NAOAPLICA'`)
     .join(' OR ');
-  return `((${literalNaoAplica}) OR EXISTS (
+  return `((${literalNaoAplica})${agrupada} OR EXISTS (
     SELECT 1 FROM "conversoes" cv
      WHERE cv.dados->>'tabela_origem' = '${tabela}'
        AND COALESCE(TRIM(cv.dados->>'coluna_origem'),'') <> ''
@@ -3709,7 +3694,7 @@ export async function listarConciliacoesComExibicao(
     if (adquirente) escopoConciliacao.push(`UPPER(COALESCE(a.dados->>'adquirente','')) = ${addConciliacao(adquirente)}`);
     const whereEscopoPendente = escopoPendente.length ? ` AND ${escopoPendente.join(' AND ')}` : '';
     const whereEscopoConciliacao = escopoConciliacao.length ? ` AND ${escopoConciliacao.join(' AND ')}` : '';
-    let contadores: { pendente: number; conciliado: number; sugerido: number; ambiguo: number } | undefined;
+    let contadores: { pendente: number; conciliado: number; sugerido: number; ambiguo: number; revisao_coopcerto: number } | undefined;
     if (incluirContadores) {
       const [pendentesRows, conciliacoesRows] = await Promise.all([
         db.$queryRawUnsafe(
@@ -3724,7 +3709,8 @@ export async function listarConciliacoesComExibicao(
           `SELECT
              COUNT(*) FILTER (WHERE c.status='CONCILIADO')::int AS conciliado,
              COUNT(*) FILTER (WHERE c.status='SUGERIDO')::int AS sugerido,
-             COUNT(*) FILTER (WHERE c.status='AMBIGUO')::int AS ambiguo
+             COUNT(*) FILTER (WHERE c.status='AMBIGUO')::int AS ambiguo,
+             COUNT(*) FILTER (WHERE c.dados->'revisao_coopcerto'->>'status'='PENDENTE')::int AS revisao_coopcerto
            FROM conciliacoes c
            LEFT JOIN vendas_adquirentes a ON a.row_id=c.venda_adquirente_id
            LEFT JOIN vendas_interdata e ON e.row_id=c.venda_interdata_id
@@ -3734,13 +3720,14 @@ export async function listarConciliacoesComExibicao(
              AND NOT (${sqlEstabelecimentoLiteralNaoAplica('vendas_adquirentes','a')})
              AND NOT (${sqlEstabelecimentoLiteralNaoAplica('vendas_interdata','e')})${whereEscopoConciliacao}`,
           ...parametrosConciliacao,
-        ) as Promise<Array<{ conciliado: number; sugerido: number; ambiguo: number }>>,
+        ) as Promise<Array<{ conciliado: number; sugerido: number; ambiguo: number; revisao_coopcerto: number }>>,
       ]);
       contadores = {
         pendente: Number(pendentesRows[0]?.pendente || 0),
         conciliado: Number(conciliacoesRows[0]?.conciliado || 0),
         sugerido: Number(conciliacoesRows[0]?.sugerido || 0),
         ambiguo: Number(conciliacoesRows[0]?.ambiguo || 0),
+        revisao_coopcerto: Number(conciliacoesRows[0]?.revisao_coopcerto || 0),
       };
     }
     if (status === 'PENDENTE') {
@@ -3830,11 +3817,35 @@ function dadosVendaComConciliacao(conciliacao: ConciliacaoVenda, status: string)
   };
 }
 
+const sqlFonteErpAgrupamento = (alias:string) => sqlRegistroNaoAplicavel('vendas_interdata',alias,false);
+const sqlFonteAdqAgrupamento = (alias:string) => sqlRegistroNaoAplicavel('vendas_adquirentes',alias);
+let agrupamentoEmCurso: Promise<unknown> | null = null;
+let ultimoAgrupamento = 0;
+export async function sincronizarParcelasErpSipag(forcar = false) {
+  if (!usarPostgres()) return;
+  if (agrupamentoEmCurso) return agrupamentoEmCurso;
+  if (!forcar && Date.now()-ultimoAgrupamento<2000) return;
+  agrupamentoEmCurso=(async()=>{
+    const inicio=Date.now();
+    await garantirDbPostgres();const db=await getDatabase();
+    const r=await db.$transaction(tx=>sincronizarAgrupamentosSipagTx(tx,sqlFonteErpAgrupamento,sqlFonteAdqAgrupamento));
+    ultimoAgrupamento=Date.now();
+    console.log(`[agrupamento-sipag] concluído ${ultimoAgrupamento-inicio}ms criados=${r.criados}`);
+    return r;
+  })();
+  try {return await agrupamentoEmCurso;} finally {agrupamentoEmCurso=null;}
+}
+async function validarGrupoTx(tx:any,erp:Record<string,unknown>,idErp:string,idAdq:string) {
+  await validarAgrupamentoSipagTx(tx,{...erp,id:idErp},idAdq,sqlFonteErpAgrupamento,sqlFonteAdqAgrupamento);
+}
+
 async function criarConciliacoesPostgres(candidatos: ConciliacaoVenda[]) {
   if (candidatos.length === 0) return;
   await garantirDbPostgres();
   const db = await getDatabase();
   await db.$transaction(async (tx) => {
+    await tx.$executeRawUnsafe('SELECT pg_advisory_xact_lock(247,1)');
+    await sincronizarVinculosPixSipagSicoobTx(tx);
     for (const conciliacaoOriginal of candidatos) {
       const existentes = await tx.$queryRawUnsafe(
         `SELECT row_id, status, dados FROM conciliacoes
@@ -3849,13 +3860,16 @@ async function criarConciliacoesPostgres(candidatos: ConciliacaoVenda[]) {
         ? { ...conciliacaoOriginal, id: existente.row_id }
         : conciliacaoOriginal;
 
-      const adq = await tx.$queryRawUnsafe(`SELECT row_id, conciliacao_id FROM "vendas_adquirentes" WHERE row_id = $1 FOR UPDATE`, conciliacao.venda_adquirente_id) as Array<{ row_id: string; conciliacao_id: string | null }>;
-      const erp = await tx.$queryRawUnsafe(`SELECT row_id, conciliacao_id FROM "vendas_interdata" WHERE row_id = $1 FOR UPDATE`, conciliacao.venda_interdata_id) as Array<{ row_id: string; conciliacao_id: string | null }>;
+      const adq = await tx.$queryRawUnsafe(`SELECT row_id, conciliacao_id, dados, ${sqlRegistroNaoAplicavel('vendas_adquirentes','vendas_adquirentes')} AS nao_aplica FROM "vendas_adquirentes" WHERE row_id = $1 FOR UPDATE`, conciliacao.venda_adquirente_id) as Array<{ row_id: string; conciliacao_id: string | null; dados:Record<string,unknown>;nao_aplica:boolean }>;
+      const erp = await tx.$queryRawUnsafe(`SELECT row_id, conciliacao_id, dados, ${sqlRegistroNaoAplicavel('vendas_interdata','vendas_interdata')} AS nao_aplica FROM "vendas_interdata" WHERE row_id = $1 FOR UPDATE`, conciliacao.venda_interdata_id) as Array<{ row_id: string; conciliacao_id: string | null;dados:Record<string,unknown>;nao_aplica:boolean }>;
       if (!adq[0] || !erp[0]) throw new Error(`Venda não encontrada ao persistir a conciliação ${conciliacao.id}.`);
       if ((adq[0].conciliacao_id && adq[0].conciliacao_id !== conciliacao.id) || (erp[0].conciliacao_id && erp[0].conciliacao_id !== conciliacao.id)) {
         continue; // Outro candidato de maior prioridade venceu durante esta execução.
       }
 
+      try { validarParConciliacao(adq[0].dados, erp[0].dados, adq[0].nao_aplica, erp[0].nao_aplica);
+        await validarGrupoTx(tx,erp[0].dados,conciliacao.venda_interdata_id,conciliacao.venda_adquirente_id);
+        if (!avaliarCandidatoHibrido({...adq[0].dados,id:conciliacao.venda_adquirente_id},{...erp[0].dados,id:conciliacao.venda_interdata_id})) continue; } catch { continue; }
       if (existente) {
         await tx.$executeRawUnsafe(
           `UPDATE conciliacoes SET status=$1, dados=$2::jsonb, data_atualizacao=NOW() WHERE row_id=$3`,
@@ -3871,6 +3885,7 @@ async function criarConciliacoesPostgres(candidatos: ConciliacaoVenda[]) {
       await tx.$executeRawUnsafe(`UPDATE "vendas_adquirentes" SET conciliacao_id = $1, dados = dados || $2::jsonb, data_atualizacao = NOW() WHERE row_id = $3`, conciliacao.id, dadosVenda, conciliacao.venda_adquirente_id);
       await tx.$executeRawUnsafe(`UPDATE "vendas_interdata" SET conciliacao_id = $1, dados = dados || $2::jsonb, data_atualizacao = NOW() WHERE row_id = $3`, conciliacao.id, dadosVenda, conciliacao.venda_interdata_id);
 
+      await atualizarParcelasGrupoTx(tx,conciliacao.venda_interdata_id,conciliacao.id,conciliacao.status);
       if (conciliacao.status === 'CONCILIADO') {
         await tx.$executeRawUnsafe(
           `UPDATE conciliacoes SET status='DESFEITO',
@@ -3892,6 +3907,7 @@ async function criarConciliacoesPostgres(candidatos: ConciliacaoVenda[]) {
         }
       }
     }
+    await sincronizarVinculosPixSipagSicoobTx(tx);
   });
 }
 
@@ -4015,25 +4031,38 @@ async function sanearAmbiguidadesPostgres(paresAtuais: ParAvaliado[], erpIdsAval
   return { desfeitas, invalidas_regra_atual: invalidasRegraAtual, vinculo_consumido: vinculoConsumido };
 }
 
-async function alterarConciliacaoPostgres(conciliacao: ConciliacaoVenda, desfazer: boolean) {
+async function alterarConciliacaoPostgres(id: string, desfazer: boolean, motivo: string, ator: AtorConciliacao) {
+  const motivoLimpo = String(motivo || '').trim();
+  if (motivoLimpo.length < 3) throw new Error('Informe um motivo com pelo menos 3 caracteres.');
   await garantirDbPostgres();
   const db = await getDatabase();
-  await db.$transaction(async (tx) => {
-    const rows = await tx.$queryRawUnsafe(`SELECT row_id FROM "conciliacoes" WHERE row_id = $1 FOR UPDATE`, conciliacao.id) as Array<{ row_id: string }>;
-    if (!rows[0]) throw new Error('Conciliação não encontrada.');
-    const adq = await tx.$queryRawUnsafe(`SELECT conciliacao_id, dados, ${sqlRegistroNaoAplicavel('vendas_adquirentes','a')} AS nao_aplica FROM "vendas_adquirentes" a WHERE row_id = $1 FOR UPDATE`, conciliacao.venda_adquirente_id) as Array<{ conciliacao_id: string | null; dados: Record<string, unknown>; nao_aplica: boolean }>;
-    const erp = await tx.$queryRawUnsafe(`SELECT conciliacao_id, dados, ${sqlRegistroNaoAplicavel('vendas_interdata','e')} AS nao_aplica FROM "vendas_interdata" e WHERE row_id = $1 FOR UPDATE`, conciliacao.venda_interdata_id) as Array<{ conciliacao_id: string | null; dados: Record<string, unknown>; nao_aplica: boolean }>;
-    if (!adq[0] || !erp[0]) throw new Error('Uma das vendas vinculadas à conciliação não existe mais.');
+  return db.$transaction(async (tx) => {
+    await tx.$executeRawUnsafe('SELECT pg_advisory_xact_lock(247,1)');
+    await sincronizarVinculosPixSipagSicoobTx(tx);
+    const rows = await tx.$queryRawUnsafe(`SELECT dados, status FROM conciliacoes WHERE row_id=$1 FOR UPDATE`, id) as Array<{dados:ConciliacaoVenda;status:string}>;
+    if (!rows[0] || rows[0].status === 'DESFEITO') throw new Error('Conciliação não encontrada ou já desfeita.');
+    const anterior = rows[0];
+    const conciliacao: ConciliacaoVenda = { ...anterior.dados, id,
+      status: desfazer ? 'DESFEITO' : 'CONCILIADO', automatico:false,
+      data_conciliacao:new Date().toISOString(), observacoes:motivoLimpo };
+    const adq = await tx.$queryRawUnsafe(`SELECT conciliacao_id, dados, ${sqlRegistroNaoAplicavel('vendas_adquirentes','a')} AS nao_aplica FROM vendas_adquirentes a WHERE row_id=$1 FOR UPDATE`, conciliacao.venda_adquirente_id) as Array<{conciliacao_id:string|null;dados:Record<string,unknown>;nao_aplica:boolean}>;
+    const erp = await tx.$queryRawUnsafe(`SELECT conciliacao_id, dados, ${sqlRegistroNaoAplicavel('vendas_interdata','e')} AS nao_aplica FROM vendas_interdata e WHERE row_id=$1 FOR UPDATE`, conciliacao.venda_interdata_id) as Array<{conciliacao_id:string|null;dados:Record<string,unknown>;nao_aplica:boolean}>;
+    if (!adq[0] || !erp[0]) throw new Error('Uma das vendas vinculadas não existe mais.');
     if (!desfazer) {
-      if (adq[0].nao_aplica || erp[0].nao_aplica) throw new Error('Conciliação bloqueada: o estabelecimento está marcado como NÃO APLICA.');
-      const codigoAdq = limparIdentificadorMatch(adq[0].dados.codigo_estabelecimento || adq[0].dados.cnpj_estabelecimento);
-      const codigoErp = limparIdentificadorMatch(erp[0].dados.cnpj_estabelecimento || erp[0].dados.codigo_estabelecimento);
-      if (!codigoAdq || !codigoErp || codigoAdq !== codigoErp) throw new Error('Conciliação bloqueada: os códigos de estabelecimento devem existir e ser idênticos.');
-    }
-    if (!desfazer && ((adq[0].conciliacao_id && adq[0].conciliacao_id !== conciliacao.id) || (erp[0].conciliacao_id && erp[0].conciliacao_id !== conciliacao.id))) {
-      throw new Error('Uma das vendas já pertence a outra conciliação.');
+      validarParConciliacao(adq[0].dados, erp[0].dados, adq[0].nao_aplica, erp[0].nao_aplica);
+      await validarGrupoTx(tx,erp[0].dados,conciliacao.venda_interdata_id,conciliacao.venda_adquirente_id);
+      if ((adq[0].conciliacao_id && adq[0].conciliacao_id !== id) || (erp[0].conciliacao_id && erp[0].conciliacao_id !== id)) throw new Error('Uma das vendas já pertence a outra conciliação.');
     }
     await tx.$executeRawUnsafe(`UPDATE "conciliacoes" SET status = $1, dados = $2::jsonb, data_atualizacao = NOW() WHERE row_id = $3`, conciliacao.status, stringifyJsonbSeguro(conciliacao as unknown as Record<string, unknown>), conciliacao.id);
+    if (desfazer && (adq[0].dados as any).revisao_coopcerto?.status === 'PENDENTE') {
+      const revisao = { ...(adq[0].dados as any).revisao_coopcerto, status: 'TRATADA_POR_REVERSAO',
+        tratada_em: new Date().toISOString(), tratada_por: ator.nome || ator.login || ator.id || '', motivo: motivoLimpo };
+      const patch = stringifyJsonbSeguro({ revisao_coopcerto: revisao });
+      (conciliacao as any).revisao_coopcerto = revisao;
+      await tx.$executeRawUnsafe('UPDATE conciliacoes SET dados=dados || $2::jsonb WHERE row_id=$1', id, patch);
+      await tx.$executeRawUnsafe('UPDATE vendas_adquirentes SET dados=dados || $2::jsonb WHERE row_id=$1 AND conciliacao_id=$3', conciliacao.venda_adquirente_id, patch, id);
+      await tx.$executeRawUnsafe('UPDATE vendas_interdata SET dados=dados || $2::jsonb WHERE row_id=$1 AND conciliacao_id=$3', conciliacao.venda_interdata_id, patch, id);
+    }
     const statusVenda = desfazer ? 'PENDENTE' : 'CONCILIADO';
     const recebimentoManual = conciliacao.tipo_match === 'MANUAL_RECEBIMENTO';
     const dadosAdq = stringifyJsonbSeguro(dadosVendaComConciliacao(conciliacao, statusVenda));
@@ -4041,6 +4070,7 @@ async function alterarConciliacaoPostgres(conciliacao: ConciliacaoVenda, desfaze
     const dadosErp = stringifyJsonbSeguro(dadosVendaComConciliacao(conciliacao, statusErp));
     await tx.$executeRawUnsafe(`UPDATE "vendas_adquirentes" SET conciliacao_id = $1, dados = dados || $2::jsonb, data_atualizacao = NOW() WHERE row_id = $3 AND (conciliacao_id = $4 OR conciliacao_id IS NULL)`, desfazer ? null : conciliacao.id, dadosAdq, conciliacao.venda_adquirente_id, conciliacao.id);
     await tx.$executeRawUnsafe(`UPDATE "vendas_interdata" SET conciliacao_id = $1, dados = dados || $2::jsonb, data_atualizacao = NOW() WHERE row_id = $3 AND (conciliacao_id = $4 OR conciliacao_id IS NULL)`, desfazer && !recebimentoManual ? null : conciliacao.id, dadosErp, conciliacao.venda_interdata_id, conciliacao.id);
+    await atualizarParcelasGrupoTx(tx,conciliacao.venda_interdata_id,desfazer ? null : conciliacao.id,statusErp);
     if (!desfazer) {
       await tx.$executeRawUnsafe(
         `UPDATE conciliacoes SET status='DESFEITO', dados=jsonb_set(jsonb_set(dados,'{status}','"DESFEITO"'::jsonb),'{observacoes}',to_jsonb($1::text)), data_atualizacao=NOW()
@@ -4048,6 +4078,12 @@ async function alterarConciliacaoPostgres(conciliacao: ConciliacaoVenda, desfaze
         `Alternativa encerrada automaticamente após confirmação de ${conciliacao.id}.`, conciliacao.id, conciliacao.venda_adquirente_id, conciliacao.venda_interdata_id,
       );
     }
+
+    await tx.$executeRawUnsafe(`INSERT INTO historico_conciliacoes (conciliacao_id,acao,status_anterior,status_novo,motivo,usuario_id,usuario_nome,detalhes) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)`,
+      id, desfazer ? 'DESFAZER' : 'CONFIRMAR', anterior.status, conciliacao.status, motivoLimpo,
+      ator.id || null, ator.nome || ator.login || null, stringifyJsonbSeguro({score:conciliacao.score,tipo_match:conciliacao.tipo_match,revisao_coopcerto:(adq[0].dados as any).revisao_coopcerto,parcelas_erp:(erp[0].dados.agrupamento_parcelas as any[]|undefined)?.map(p=>p.id)}));
+    await sincronizarVinculosPixSipagSicoobTx(tx);
+    return conciliacao;
   });
 }
 
@@ -4088,9 +4124,7 @@ async function executarConciliacaoHibridaPostgres(opcoes: OpcoesConciliacaoHibri
     const lote = await db.$queryRawUnsafe(
       `SELECT e.pk::bigint::text AS pk, e.row_id AS id, e.dados FROM "vendas_interdata" e
        WHERE ${filtros.join(' AND ')} AND e.pk > $${parametros.length + 1}
-       ORDER BY CASE WHEN NULLIF(e.dados->>'parcelas','') IS NULL THEN 1 ELSE 0 END,
-                CASE WHEN e.dados->>'parcelas' ~ '\\d+$' THEN (regexp_match(e.dados->>'parcelas','(\\d+)$'))[1]::int ELSE 0 END DESC,
-                e.pk ASC LIMIT $${parametros.length + 2}`,
+       ORDER BY e.pk ASC LIMIT $${parametros.length + 2}`,
       ...paramsLote,
     ) as Array<{ pk: string; id: string; dados: Record<string, unknown> }>;
     if (lote.length === 0) break;
@@ -4110,7 +4144,9 @@ async function executarConciliacaoHibridaPostgres(opcoes: OpcoesConciliacaoHibri
         AND COALESCE(NULLIF(a.dados->>'status_conciliacao',''),'PENDENTE') = 'PENDENTE'
         AND UPPER(COALESCE(a.dados->>'duplicidade_status','')) <> 'DUPLICADO_PROVAVEL'
         AND UPPER(COALESCE(a.dados->>'pix_redundante','NAO')) <> 'SIM'
+        AND COALESCE(a.dados->>'pix_vinculo_conflito','') = ''
         AND UPPER(TRIM(COALESCE(a.dados->>'status_transacao',''))) = 'AUTORIZADO'
+        AND COALESCE(a.dados->'revisao_coopcerto'->>'status','') <> 'PENDENTE'
         AND ${sqlDataNormalizada('a')} <> '' AND ${sqlDataNormalizada('e')} <> ''
         AND ABS((${sqlDataNormalizada('a')})::date - (${sqlDataNormalizada('e')})::date) <= 1
         AND ${sqlValorCentavos('a')} = ${sqlValorCentavos('e')}
@@ -4433,38 +4469,50 @@ async function promoverSugestoesAltaConfiancaPostgres(scoreMinimo = 80, escopo: 
   await garantirDbPostgres();
   const db = await getDatabase();
   const promovidas = await db.$transaction(async (tx) => {
+    await tx.$executeRawUnsafe('SELECT pg_advisory_xact_lock(247,1)');
+    await sincronizarVinculosPixSipagSicoobTx(tx);
     const rows = await tx.$queryRawUnsafe(
-      `SELECT c.row_id AS id, c.venda_adquirente_id, c.venda_interdata_id, COALESCE((c.dados->>'score')::numeric,0)::float8 AS score
+      `SELECT c.row_id AS id, c.venda_adquirente_id, c.venda_interdata_id, COALESCE((c.dados->>'score')::numeric,0)::float8 AS score, a.dados AS adquirente_dados, e.dados AS erp_dados, ${sqlRegistroNaoAplicavel('vendas_adquirentes','a')} AS adq_nao_aplica, ${sqlRegistroNaoAplicavel('vendas_interdata','e')} AS erp_nao_aplica
        FROM conciliacoes c
        JOIN vendas_adquirentes a ON a.row_id=c.venda_adquirente_id AND a.conciliacao_id=c.row_id
        JOIN vendas_interdata e ON e.row_id=c.venda_interdata_id AND e.conciliacao_id=c.row_id
        WHERE c.status='SUGERIDO' AND COALESCE((c.dados->>'score')::numeric,0) >= $1
          AND ($2::text = '' OR ${sqlDataNormalizada('e')} >= $2)
          AND ($3::text = '' OR ${sqlDataNormalizada('e')} <= $3)
-       FOR UPDATE OF c`, scoreMinimo,
+       FOR UPDATE OF c, a, e`, scoreMinimo,
       escopo.dataInicial || '', escopo.dataFinal || '',
-    ) as Array<{id:string;venda_adquirente_id:string;venda_interdata_id:string;score:number}>;
+    ) as Array<{id:string;venda_adquirente_id:string;venda_interdata_id:string;score:number;adquirente_dados:Record<string,unknown>;erp_dados:Record<string,unknown>;adq_nao_aplica:boolean;erp_nao_aplica:boolean}>;
+    let total = 0;
     for (const row of rows) {
+      try { validarParConciliacao(row.adquirente_dados, row.erp_dados, row.adq_nao_aplica, row.erp_nao_aplica); } catch { continue; }
+      const atual = avaliarCandidatoHibrido({...row.adquirente_dados,id:row.venda_adquirente_id}, {...row.erp_dados,id:row.venda_interdata_id});
+      if (!atual || atual.score < scoreMinimo) continue;
+      try {await validarGrupoTx(tx,row.erp_dados,row.venda_interdata_id,row.venda_adquirente_id);} catch {continue;}
+      row.score = atual.score;
       await tx.$executeRawUnsafe(
-        `UPDATE conciliacoes SET status='CONCILIADO', dados=jsonb_set(jsonb_set(jsonb_set(dados,'{status}','"CONCILIADO"'::jsonb),'{automatico}','true'::jsonb),'{observacoes}',to_jsonb($1::text)), data_atualizacao=NOW() WHERE row_id=$2`,
-        `Conciliação automática por confiança alta (score >= ${scoreMinimo}).`, row.id,
+        `UPDATE conciliacoes SET status='CONCILIADO', dados=jsonb_set(jsonb_set(jsonb_set(dados,'{status}','"CONCILIADO"'::jsonb),'{automatico}','true'::jsonb),'{observacoes}',to_jsonb($1::text)) || $3::jsonb, data_atualizacao=NOW() WHERE row_id=$2`,
+        `Conciliação automática por confiança alta (score >= ${scoreMinimo}).`, row.id, JSON.stringify({score:atual.score,criterios:atual.criterios,tipo_match:atual.estrategia}),
       );
+      total++;
       const dadosVenda = JSON.stringify({conciliacao_id:row.id,status_conciliacao:'CONCILIADO',score_conciliacao:Number(row.score||0),tipo_match:'AUTO_ALTA_CONFIANCA'});
       await tx.$executeRawUnsafe(`UPDATE vendas_adquirentes SET dados=dados || $1::jsonb, data_atualizacao=NOW() WHERE row_id=$2 AND conciliacao_id=$3`, dadosVenda, row.venda_adquirente_id, row.id);
       await tx.$executeRawUnsafe(`UPDATE vendas_interdata SET dados=dados || $1::jsonb, data_atualizacao=NOW() WHERE row_id=$2 AND conciliacao_id=$3`, dadosVenda, row.venda_interdata_id, row.id);
+      await atualizarParcelasGrupoTx(tx,row.venda_interdata_id,row.id,'CONCILIADO');
       await tx.$executeRawUnsafe(
         `INSERT INTO historico_conciliacoes (conciliacao_id, acao, status_anterior, status_novo, motivo, usuario_nome, detalhes)
          VALUES ($1,'AUTO_CONFIRMAR_ALTA_CONFIANCA','SUGERIDO','CONCILIADO',$2,'Sistema',$3::jsonb)`,
         row.id, `Score ${Number(row.score||0)} atingiu o limite automático de ${scoreMinimo}.`, JSON.stringify({score:row.score,score_minimo:scoreMinimo}),
       );
     }
-    return rows.length;
+    await sincronizarVinculosPixSipagSicoobTx(tx);
+    return total;
   });
   return promovidas;
 }
 
 export async function executarConciliacaoAutomatica(opcoes: (OpcoesConciliacaoHibrida & { limiteCandidatos?: number }) = {}) {
   if (usarPostgres()) {
+    if (!opcoes.simular) await sincronizarParcelasErpSipag(true);
     const resultado = await executarConciliacaoHibridaPostgres(opcoes);
     if (!opcoes.simular && opcoes.confirmarAutomatico !== false) {
       const promovidas = await promoverSugestoesAltaConfiancaPostgres(80, { dataInicial: opcoes.dataInicial, dataFinal: opcoes.dataFinal });
@@ -4567,7 +4615,7 @@ function dadosJsonObjeto(venda: VendaAdquirente): Record<string, unknown> {
 }
 
 function patchVendaEconomicaVoucher(economica: VendaAdquirente, captura: VendaAdquirente, estrategia: EstrategiaVoucher): VendaAdquirente {
-  const adquirenteCaptura = normalizarChaveVoucher(captura.adquirente);
+  const adquirenteCaptura = redeCapturaVoucher(captura);
   const dadosFinanceiros = dadosJsonObjeto(economica);
   const dadosCaptura = dadosJsonObjeto(captura);
   return {
@@ -4610,7 +4658,7 @@ function patchCapturaVoucher(captura: VendaAdquirente, economica: VendaAdquirent
   return {
     ...captura,
     conciliacao_id: '', status_conciliacao: '', score_conciliacao: undefined, tipo_match: '',
-    adquirente_captura: normalizarChaveVoucher(captura.adquirente),
+    adquirente_captura: redeCapturaVoucher(captura),
     vinculo_voucher_id: economica.id,
     status_vinculo_voucher: 'VINCULADO',
     registro_canonico: false,
@@ -4620,7 +4668,7 @@ function patchCapturaVoucher(captura: VendaAdquirente, economica: VendaAdquirent
       voucher_mesclado: true,
       conciliacao_id_captura_original: captura.conciliacao_id || '',
       adquirente_economica: estrategia.adquirente,
-      adquirente_captura: normalizarChaveVoucher(captura.adquirente),
+      adquirente_captura: redeCapturaVoucher(captura),
       bandeira_captura: normalizarChaveVoucher(captura.bandeira),
       nsu_adquirente: economica.nsu || '',
       nsu_captura: captura.nsu || '',
@@ -4670,7 +4718,7 @@ export async function consolidarVendasVoucherCapturadas(
         escopo.dataInicial || '', escopo.dataFinal || '',
       ) as Array<{ dados: VendaAdquirente }>).map((item) => item.dados)
     : await lerTabela<VendaAdquirente[]>(vendasAdquirentesTabela, []);
-  const vendas = todasVendas.filter(ehVendaCanonicaAdquirente);
+  const vendas = todasVendas.filter(ehVendaCanonicaAdquirente).filter(v => !registroContemNaoAplica(v as unknown as Record<string, unknown>));
   const atualizacoes = new Map<string, VendaAdquirente>();
 
   const estatisticas = new Map<string, ResultadoConsolidacaoVoucherPorAdquirente>();
@@ -4829,74 +4877,46 @@ export async function verificarBasesDisponiveisParaConciliacao() {
 
 
 export async function confirmarConciliacao(id: string, motivo = '', ator: AtorConciliacao = {}) {
+  return { sucesso: true, conciliacao: await alterarConciliacaoPostgres(id, false, motivo, ator) };
+}
+
+/** Aceitação humana dos dados atualmente armazenados; não altera valores nem status. */
+export async function tratarRevisaoCoopcerto(id: string, hashRecebido: string, motivo: string, ator: AtorConciliacao = {}) {
   const motivoLimpo = String(motivo || '').trim();
-  if (motivoLimpo.length < 3) throw new Error('Informe um motivo com pelo menos 3 caracteres.');
-  const [conciliacoes, vendasAdqOriginais, vendasErpOriginais] = await Promise.all([
-    lerTabela<ConciliacaoVenda[]>(conciliacoesTabela, []),
-    lerTabela<VendaAdquirente[]>(vendasAdquirentesTabela, []),
-    lerTabela<VendaInterdata[]>(vendasInterdataTabela, []),
-  ]);
-  const conciliacao = conciliacoes.find((item) => item.id === id && item.status !== 'DESFEITO');
-  if (!conciliacao) throw new Error('Conciliação não encontrada.');
-  const atualizada: ConciliacaoVenda = {
-    ...conciliacao,
-    status: 'CONCILIADO',
-    automatico: false,
-    data_conciliacao: new Date().toISOString(),
-    observacoes: motivoLimpo,
-  };
-  const conciliacoesAtualizadas = conciliacoes.map((item) => item.id === id ? atualizada : item);
-  const vendasAdqAtualizadas = vendasAdqOriginais.map((venda) => venda.id === atualizada.venda_adquirente_id
-    ? { ...venda, conciliacao_id: atualizada.id, status_conciliacao: 'CONCILIADO', score_conciliacao: atualizada.score, tipo_match: atualizada.tipo_match }
-    : venda);
-  const vendasErpAtualizadas = vendasErpOriginais.map((venda) => venda.id === atualizada.venda_interdata_id
-    ? { ...venda, conciliacao_id: atualizada.id, status_conciliacao: 'CONCILIADO', score_conciliacao: atualizada.score, tipo_match: atualizada.tipo_match }
-    : venda);
-  if (usarPostgres()) await alterarConciliacaoPostgres(atualizada, false);
-  else await Promise.all([
-    gravarTabela(conciliacoesTabela, conciliacoesAtualizadas),
-    gravarTabela(vendasAdquirentesTabela, vendasAdqAtualizadas),
-    gravarTabela(vendasInterdataTabela, vendasErpAtualizadas),
-  ]);
-  await registrarHistoricoConciliacao(id, 'CONFIRMAR', conciliacao.status, 'CONCILIADO', motivoLimpo, ator, { score: conciliacao.score, tipo_match: conciliacao.tipo_match });
-  return { sucesso: true, conciliacao: atualizada };
+  if (motivoLimpo.length < 10 || motivoLimpo.length > 2000) throw new Error('Justifique a revisão com 10 a 2000 caracteres.');
+  const db = await getDatabase();
+  return db.$transaction(async tx => {
+    await tx.$executeRawUnsafe('SELECT pg_advisory_xact_lock(247,1)');
+    await tx.$queryRawUnsafe('SELECT pg_advisory_xact_lock(242, 1)');
+    const rows = await tx.$queryRawUnsafe('SELECT dados FROM vendas_adquirentes WHERE row_id=$1 FOR UPDATE', id) as Array<{dados:VendaAdquirente}>;
+    const venda = rows[0]?.dados;
+    const revisao = (venda as any)?.revisao_coopcerto;
+    if (!venda || revisao?.status !== 'PENDENTE') throw new Error('Não há revisão COOPCERTO pendente para esta venda.');
+    if (!hashRecebido || revisao.hash_recebido !== hashRecebido) throw new Error('A revisão mudou. Atualize a tela e confira a nova informação recebida.');
+    const concs = await tx.$queryRawUnsafe(`SELECT row_id,status,venda_interdata_id FROM conciliacoes
+      WHERE venda_adquirente_id=$1 AND status <> 'DESFEITO' ORDER BY row_id FOR UPDATE`, id) as Array<{row_id:string;status:string;venda_interdata_id:string}>;
+    if (concs.length && estadoCoopcerto(venda) !== 'AUTORIZADO')
+      throw new Error('Venda não autorizada com vínculo histórico: desfaça a conciliação com justificativa antes de tratar a revisão.');
+    const tratada = { ...revisao, status: 'TRATADA_MANUALMENTE', tratada_em: new Date().toISOString(),
+      tratada_por: ator.nome || ator.login || ator.id || '', usuario_id: ator.id || '', motivo: motivoLimpo };
+    const historico = Array.isArray((venda as any).historico_revisoes_coopcerto) ? (venda as any).historico_revisoes_coopcerto : [];
+    const patch = stringifyJsonbSeguro({ revisao_coopcerto: tratada, historico_revisoes_coopcerto: [...historico, tratada] });
+    await tx.$executeRawUnsafe('UPDATE vendas_adquirentes SET dados=dados || $2::jsonb,data_atualizacao=NOW() WHERE row_id=$1', id, patch);
+    for (const conc of concs) {
+      await tx.$executeRawUnsafe('UPDATE conciliacoes SET dados=dados || $2::jsonb,data_atualizacao=NOW() WHERE row_id=$1', conc.row_id, patch);
+      await tx.$executeRawUnsafe('UPDATE vendas_interdata SET dados=dados || $2::jsonb,data_atualizacao=NOW() WHERE row_id=$1 AND conciliacao_id=$3', conc.venda_interdata_id, patch, conc.row_id);
+      await tx.$executeRawUnsafe(`INSERT INTO historico_conciliacoes
+        (conciliacao_id,acao,status_anterior,status_novo,motivo,usuario_id,usuario_nome,detalhes)
+        VALUES($1,'REVISAR_ATUALIZACAO_COOPCERTO',$2,$2,$3,$4,$5,$6::jsonb)`,
+        conc.row_id, conc.status, motivoLimpo, ator.id || null, ator.nome || ator.login || null,
+        stringifyJsonbSeguro({ venda_adquirente_id: id, revisao_coopcerto: tratada }));
+    }
+    return { sucesso: true, revisao_coopcerto: tratada };
+  });
 }
 
 export async function desfazerConciliacao(id: string, motivo = '', ator: AtorConciliacao = {}) {
-  const motivoLimpo = String(motivo || '').trim();
-  if (motivoLimpo.length < 3) throw new Error('Informe um motivo com pelo menos 3 caracteres.');
-  const [conciliacoes, vendasAdqOriginais, vendasErpOriginais] = await Promise.all([
-    lerTabela<ConciliacaoVenda[]>(conciliacoesTabela, []),
-    lerTabela<VendaAdquirente[]>(vendasAdquirentesTabela, []),
-    lerTabela<VendaInterdata[]>(vendasInterdataTabela, []),
-  ]);
-  const conciliacao = conciliacoes.find((item) => item.id === id && item.status !== 'DESFEITO');
-  if (!conciliacao) throw new Error('Conciliação não encontrada ou já desfeita.');
-  const desfeita: ConciliacaoVenda = {
-    ...conciliacao,
-    status: 'DESFEITO',
-    automatico: false,
-    data_conciliacao: new Date().toISOString(),
-    observacoes: motivoLimpo,
-  };
-  const conciliacoesAtualizadas = conciliacoes.map((item) => item.id === id ? desfeita : item);
-  const vendasAdqAtualizadas = vendasAdqOriginais.map((venda) => venda.id === conciliacao.venda_adquirente_id
-    ? { ...venda, conciliacao_id: '', status_conciliacao: 'PENDENTE', score_conciliacao: 0, tipo_match: '' }
-    : venda);
-  const recebimentoManual = conciliacao.tipo_match === 'MANUAL_RECEBIMENTO';
-  const vendasErpAtualizadas = vendasErpOriginais.map((venda) => venda.id === conciliacao.venda_interdata_id
-    ? recebimentoManual
-      ? { ...venda, conciliacao_id: conciliacao.id, status_conciliacao: 'DESFEITO', score_conciliacao: conciliacao.score, tipo_match: conciliacao.tipo_match }
-      : { ...venda, conciliacao_id: '', status_conciliacao: 'PENDENTE', score_conciliacao: 0, tipo_match: '' }
-    : venda);
-  if (usarPostgres()) await alterarConciliacaoPostgres(desfeita, true);
-  else await Promise.all([
-    gravarTabela(conciliacoesTabela, conciliacoesAtualizadas),
-    gravarTabela(vendasAdquirentesTabela, vendasAdqAtualizadas),
-    gravarTabela(vendasInterdataTabela, vendasErpAtualizadas),
-  ]);
-  await registrarHistoricoConciliacao(id, 'DESFAZER', conciliacao.status, 'DESFEITO', motivoLimpo, ator, { score: conciliacao.score, tipo_match: conciliacao.tipo_match });
-  return { sucesso: true, conciliacao: desfeita };
+  return { sucesso: true, conciliacao: await alterarConciliacaoPostgres(id, true, motivo, ator) };
 }
 
 export async function obterDetalhesConciliacao(id: string) {
@@ -4911,7 +4931,7 @@ export async function obterDetalhesConciliacao(id: string) {
   const rows = await db.$queryRawUnsafe(
     `SELECT c.row_id AS id, c.status, c.dados, a.dados AS venda_adquirente, e.dados AS venda_interdata
      FROM conciliacoes c LEFT JOIN vendas_adquirentes a ON a.row_id=c.venda_adquirente_id LEFT JOIN vendas_interdata e ON e.row_id=c.venda_interdata_id
-     WHERE c.row_id=$1`, id,
+     WHERE c.row_id=$1 AND (a.row_id IS NULL OR NOT (${sqlRegistroNaoAplicavel('vendas_adquirentes','a')}))`, id,
   ) as Array<any>;
   if (!rows[0]) throw new Error('Conciliação não encontrada.');
   const historico = await db.$queryRawUnsafe(
@@ -5037,7 +5057,8 @@ export async function obterInicializacaoConciliacoes(filtros: FiltrosCentralConc
       db.$queryRawUnsafe(`SELECT
           COUNT(*) FILTER (WHERE c.status='CONCILIADO')::int AS conciliado,
           COUNT(*) FILTER (WHERE c.status='SUGERIDO')::int AS sugerido,
-          COUNT(*) FILTER (WHERE c.status='AMBIGUO')::int AS ambiguo
+          COUNT(*) FILTER (WHERE c.status='AMBIGUO')::int AS ambiguo,
+             COUNT(*) FILTER (WHERE c.dados->'revisao_coopcerto'->>'status'='PENDENTE')::int AS revisao_coopcerto
         FROM conciliacoes c
         LEFT JOIN vendas_adquirentes a ON a.row_id=c.venda_adquirente_id
         LEFT JOIN vendas_interdata e ON e.row_id=c.venda_interdata_id
@@ -5045,7 +5066,7 @@ export async function obterInicializacaoConciliacoes(filtros: FiltrosCentralConc
           AND e.registro_nao_aplicavel = FALSE
           AND (a.row_id IS NULL OR a.registro_nao_aplicavel = FALSE)
           ${condConc.length ? `AND ${condConc.join(' AND ')}` : ''}`, ...paramsConc),
-    ]) as [Array<{pendente:number}>, Array<{conciliado:number;sugerido:number;ambiguo:number}>];
+    ]) as [Array<{pendente:number}>, Array<{conciliado:number;sugerido:number;ambiguo:number;revisao_coopcerto:number}>];
     return {
       data_mais_recente: String(rows[0]?.data_mais_recente || ''),
       estabelecimentos: rows[0]?.estabelecimentos || [],
@@ -5055,6 +5076,7 @@ export async function obterInicializacaoConciliacoes(filtros: FiltrosCentralConc
         conciliado: Number(conciliacoesRows[0]?.conciliado || 0),
         sugerido: Number(conciliacoesRows[0]?.sugerido || 0),
         ambiguo: Number(conciliacoesRows[0]?.ambiguo || 0),
+        revisao_coopcerto: Number(conciliacoesRows[0]?.revisao_coopcerto || 0),
       },
     };
   }
@@ -5084,11 +5106,12 @@ const sqlSegundosHoraVenda = (alias: string) => {
   return `(CASE WHEN ${hora} IS NOT NULL THEN EXTRACT(EPOCH FROM (${hora})::time)::int ELSE NULL END)`;
 };
 
-export async function listarCandidatosConciliacaoManual(lado: LadoConciliacaoManual, limite = 80, offset = 0, busca = '', adquirente = '', dataInicial = '', dataFinal = '', estabelecimento = '', priorizarErpId = '') {
+export async function listarCandidatosConciliacaoManual(lado: LadoConciliacaoManual, limite = 80, offset = 0, busca = '', adquirente = '', dataInicial = '', dataFinal = '', estabelecimento = '', priorizarErpId = '', statusTransacao = 'AUTORIZADO') {
   const tamanho = Math.max(1, Math.min(Number(limite || 80), 200));
   const inicio = Math.max(0, Number(offset || 0));
   const termo = String(busca || '').trim();
   const filtroAdquirente = String(adquirente || '').trim().toUpperCase();
+  const filtroStatus = String(statusTransacao || '').trim().toUpperCase();
   const filtroEstabelecimento = String(estabelecimento || '').trim().toUpperCase();
   const inicioData = /^\d{4}-\d{2}-\d{2}$/.test(String(dataInicial || '').trim()) ? String(dataInicial).trim() : '';
   const fimData = /^\d{4}-\d{2}-\d{2}$/.test(String(dataFinal || '').trim()) ? String(dataFinal).trim() : '';
@@ -5120,8 +5143,11 @@ export async function listarCandidatosConciliacaoManual(lado: LadoConciliacaoMan
       `UPPER(COALESCE(${alias}.dados->>'duplicidade_status','')) <> 'DUPLICADO_PROVAVEL'`,
     ];
     if (lado === 'ADQUIRENTE') {
-      condicoes.push(`${alias}.status_filtro = 'AUTORIZADO'`);
+      condicoes.push(`UPPER(COALESCE(${alias}.dados->>'utilidade_status','UTIL')) <> 'NAO_UTIL'`);
+      condicoes.push(`LOWER(COALESCE(${alias}.dados->>'suprimido_por_vinculo_voucher','false')) <> 'true'`);
+      if (filtroStatus) { params.push(filtroStatus); condicoes.push(`${alias}.status_filtro = $${params.length}`); }
       condicoes.push(`UPPER(COALESCE(${alias}.dados->>'pix_redundante','NAO')) <> 'SIM'`);
+      condicoes.push(`COALESCE(${alias}.dados->>'pix_vinculo_conflito','') = ''`);
     }
     if (termo) {
       params.push(`%${termo}%`); const p=`$${params.length}`;
@@ -5140,6 +5166,8 @@ export async function listarCandidatosConciliacaoManual(lado: LadoConciliacaoMan
     }
     if (lado === 'ADQUIRENTE' && filtroAdquirente) { params.push(filtroAdquirente); condicoes.push(`${alias}.adquirente_filtro=$${params.length}`); }
     const where=condicoes.join(' AND ');
+    const statusCondicoes = condicoes.filter(c => !c.startsWith(`${alias}.status_filtro =`));
+    const opcoesStatus = lado === 'ADQUIRENTE' ? await db.$queryRawUnsafe(`SELECT DISTINCT ${alias}.status_filtro AS status FROM ${tabela} ${alias} WHERE ${statusCondicoes.join(' AND ')} AND ${alias}.status_filtro <> '' ${filtroStatus ? 'AND $1::text IS NOT NULL' : ''} ORDER BY status`, ...params) as Array<{status:string}> : [];
     const totalRows=await db.$queryRawUnsafe(`SELECT COUNT(*)::int AS total FROM ${tabela} ${alias} WHERE ${where}`,...params) as Array<{total:number}>;
     let ordemPrioridade = '';
     if (lado === 'ADQUIRENTE' && referenciaErp) {
@@ -5156,7 +5184,7 @@ export async function listarCandidatosConciliacaoManual(lado: LadoConciliacaoMan
        ORDER BY ${ordemPrioridade}${sqlDataNormalizada(alias)} DESC, COALESCE(${alias}.dados->>'hora_venda',${alias}.dados->>'data_venda_hora','') DESC, ${alias}.pk DESC
        LIMIT $${params.length-1} OFFSET $${params.length}`,...params,
     ) as Array<{id:string;dados:Record<string,unknown>}>;
-    return { lado, linhas: rows.map(r=>aplicarBandeiraParaExibicao({...r.dados,id:r.id})), total_linhas:Number(totalRows[0]?.total||0), limite:tamanho, offset:inicio, priorizacao_erp_id: referenciaErp ? idReferencia : '' };
+    return { lado, opcoes_status: opcoesStatus.map(r=>r.status), linhas: rows.map(r=>aplicarBandeiraParaExibicao({...r.dados,id:r.id})), total_linhas:Number(totalRows[0]?.total||0), limite:tamanho, offset:inicio, priorizacao_erp_id: referenciaErp ? idReferencia : '' };
   }
   const dados = lado === 'ERP' ? await lerTabela<VendaInterdata[]>(vendasInterdataTabela, []) : await lerTabela<VendaAdquirente[]>(vendasAdquirentesTabela, []);
   const referenciaErp = lado === 'ADQUIRENTE' && priorizarErpId
@@ -5168,7 +5196,7 @@ export async function listarCandidatosConciliacaoManual(lado: LadoConciliacaoMan
     .filter(v=>!registroContemNaoAplica(v))
     .filter(v=>textoFiltro(v.duplicidade_status)!=='DUPLICADO_PROVAVEL')
     .filter(v=>lado==='ERP'||textoFiltro(v.pix_redundante)!=='SIM')
-    .filter(v=>lado==='ERP'||textoFiltro(v.status_transacao)==='AUTORIZADO')
+    .filter(v=>lado==='ERP'||!filtroStatus||textoFiltro(v.status_transacao)===filtroStatus)
     .filter(v=>!termoUpper || [v.nsu,v.codigo_autorizacao,v.autorizacao,v.valor_bruto, termoValor ? String(v.valor_bruto||'').replace(',','.') : ''].some(x=>String(x||'').toUpperCase().includes(termoUpper) || (!!termoValor && String(x||'').includes(termoValor))))
     .filter(v=>!inicioData || normalizarDataManual(v.data_venda)>=inicioData)
     .filter(v=>!fimData || normalizarDataManual(v.data_venda)<=fimData)
@@ -5202,9 +5230,13 @@ export async function criarConciliacaoManual(vendaInterdataId: string, vendaAdqu
   if (usarPostgres()) {
     await garantirDbPostgres(); const db=await getDatabase();
     await db.$transaction(async tx=>{
-      const adqRows=await tx.$queryRawUnsafe(`SELECT row_id,conciliacao_id,dados FROM vendas_adquirentes WHERE row_id=$1 FOR UPDATE`,adqId) as Array<any>;
+      await tx.$executeRawUnsafe('SELECT pg_advisory_xact_lock(247,1)');
+    await sincronizarVinculosPixSipagSicoobTx(tx);
+      const adqRows=await tx.$queryRawUnsafe(`SELECT row_id,conciliacao_id,dados, ${sqlRegistroNaoAplicavel('vendas_adquirentes','a')} AS nao_aplica FROM vendas_adquirentes a WHERE row_id=$1 FOR UPDATE`,adqId) as Array<any>;
       const adq=adqRows[0];
       if(!adq) throw new Error('A venda da adquirente selecionada não foi encontrada.');
+      validarElegibilidadeConciliacao(adq.dados, 'ADQUIRENTE');
+      if(adq.nao_aplica) throw new Error('Conciliação bloqueada: adquirente NÃO APLICA.');
       if(adq.conciliacao_id) throw new Error('A venda da adquirente já foi conciliada por outra operação. Atualize a tela e selecione novamente.');
 
       if(criarRecebimento){
@@ -5227,7 +5259,7 @@ export async function criarConciliacaoManual(vendaInterdataId: string, vendaAdqu
           tipo_produto:String(dadosAdq.modalidade||''),
           tipo_produto_original:String(dadosAdq.modalidade_original||dadosAdq.modalidade||''),
           parcelas:String(dadosAdq.parcelas||''),
-          cnpj_estabelecimento:String(dadosAdq.cnpj_estabelecimento||''),
+          cnpj_estabelecimento:String(dadosAdq.codigo_estabelecimento||dadosAdq.cnpj_estabelecimento||''),
           id_venda_erp:erpId,
           status_venda:String(dadosAdq.status_transacao||'RECEBIMENTO'),
           status_venda_original:String(dadosAdq.status_transacao_original||dadosAdq.status_transacao||'RECEBIMENTO'),
@@ -5238,8 +5270,10 @@ export async function criarConciliacaoManual(vendaInterdataId: string, vendaAdqu
         };
         await tx.$executeRawUnsafe(`INSERT INTO vendas_interdata (row_id,hash_linha,dados,data_criacao,data_atualizacao) VALUES ($1,$2,$3::jsonb,NOW(),NOW())`,erpId,recebimentoErp.hash_linha,stringifyJsonbSeguro(recebimentoErp as any));
       } else {
-        const erp=await tx.$queryRawUnsafe(`SELECT row_id,conciliacao_id FROM vendas_interdata WHERE row_id=$1 FOR UPDATE`,erpId) as Array<any>;
+        const erp=await tx.$queryRawUnsafe(`SELECT row_id,conciliacao_id,dados, ${sqlRegistroNaoAplicavel('vendas_interdata','e')} AS nao_aplica FROM vendas_interdata e WHERE row_id=$1 FOR UPDATE`,erpId) as Array<any>;
         if(!erp[0]) throw new Error('A venda do ERP selecionada não foi encontrada.');
+        validarParConciliacao(adq.dados, erp[0].dados, adq.nao_aplica, erp[0].nao_aplica);
+        await validarGrupoTx(tx,erp[0].dados,erpId,adqId);
         if(erp[0].conciliacao_id) throw new Error('A venda do ERP já foi conciliada por outra operação. Atualize a tela e selecione novamente.');
       }
 
@@ -5247,7 +5281,9 @@ export async function criarConciliacaoManual(vendaInterdataId: string, vendaAdqu
       const dadosVenda=stringifyJsonbSeguro(dadosVendaComConciliacao(conciliacao,'CONCILIADO'));
       await tx.$executeRawUnsafe(`UPDATE vendas_adquirentes SET conciliacao_id=$1,dados=dados||$2::jsonb,data_atualizacao=NOW() WHERE row_id=$3`,id,dadosVenda,adqId);
       await tx.$executeRawUnsafe(`UPDATE vendas_interdata SET conciliacao_id=$1,dados=dados||$2::jsonb,data_atualizacao=NOW() WHERE row_id=$3`,id,dadosVenda,erpId);
+      await atualizarParcelasGrupoTx(tx,erpId,id,'CONCILIADO');
       await tx.$executeRawUnsafe(`INSERT INTO historico_conciliacoes (conciliacao_id,acao,status_anterior,status_novo,motivo,usuario_id,usuario_nome,detalhes) VALUES ($1,$2,'PENDENTE','CONCILIADO',$3,$4,$5,$6::jsonb)`,id,criarRecebimento?'CONCILIAR_RECEBIMENTO':'CONCILIAR_MANUALMENTE',motivoLimpo,ator.id||null,ator.nome||ator.login||null,JSON.stringify({venda_interdata_id:erpId,venda_adquirente_id:adqId,recebimento:criarRecebimento,erp_sintetico:criarRecebimento?'Recebimento de contas':null}));
+      await sincronizarVinculosPixSipagSicoobTx(tx);
     });
     return {sucesso:true,conciliacao,recebimento:criarRecebimento};
   }
@@ -5375,7 +5411,9 @@ export async function obterDadosTabela(nomeTabela: string, limite = 500, offset 
   const tamanhoPagina = Math.min(Math.max(1, Number(limite || 500)), 2_000);
   const inicio = Math.max(0, Number(offset || 0));
   const parametros: unknown[] = [];
-  const condicoesBase: string[] = [];
+  const condicoesBase: string[] = [
+    `REGEXP_REPLACE(TRANSLATE(UPPER(COALESCE(dados->>'pagador_documento','')), 'ÁÀÂÃÉÊÍÓÔÕÚÇ', 'AAAAEEIOOOUC'), '[^A-Z0-9]', '', 'g') <> 'NAOAPLICA'`,
+  ];
   if (nomeTabela === 'vendas_adquirentes') {
     condicoesBase.push(`COALESCE(dados->>'tipo_registro','VENDA') = 'VENDA'`);
     condicoesBase.push(`NOT (${sqlRegistroNaoAplicavel('vendas_adquirentes')})`);
@@ -5540,201 +5578,6 @@ export async function excluirConversaoManual(id: string) {
   await gravarTabela(conversoesTabela, restante);
   return { sucesso: true, id };
 }
-
-export type CatalogoBinItem = {
-  bin: string;
-  bandeira: string;
-  status: 'IDENTIFICADO' | 'PENDENTE';
-  origem: string;
-  ativo: boolean;
-  observacao: string;
-  quantidade_transacoes: number;
-  modalidades: string[];
-  conversao_id: string;
-  data_atualizacao: string;
-  emissor?: string;
-  pais?: string;
-  tipo_cartao?: string;
-  consulta_online_status?: string;
-  consulta_online_em?: string;
-  consulta_online_erro?: string;
-};
-
-async function sincronizarCatalogoBinsPostgres(importacaoIds: string[] = []) {
-  const db = await getDatabase();
-  await db.$executeRawUnsafe(`
-    INSERT INTO catalogo_bins (bin,status,origem)
-    SELECT DISTINCT COALESCE(NULLIF(dados->>'bandeira_original',''), dados->>'bandeira'),
-           'PENDENTE', 'IMPORTACAO'
-      FROM vendas_adquirentes
-     WHERE UPPER(COALESCE(dados->>'adquirente','')) = 'SIPAG'
-       AND COALESCE(NULLIF(dados->>'bandeira_original',''), dados->>'bandeira') ~ '^[0-9]{6}$'
-       AND ($1::text[] = '{}'::text[] OR COALESCE(NULLIF(dados->>'ultima_importacao_id',''),NULLIF(dados->'dados_json'->>'ultima_importacao_id',''),dados->>'importacao_id','') = ANY($1::text[]))
-    ON CONFLICT (bin) DO NOTHING
-  `, importacaoIds);
-  // A base local resolve primeiro os BINs realmente observados. Decisões manuais
-  // existentes têm prioridade e não são sobrescritas.
-  await db.$executeRawUnsafe(`
-    INSERT INTO catalogo_bins (bin,bandeira,status,origem,ativo,observacao,emissor,pais,tipo_cartao,data_atualizacao)
-    SELECT r.bin,r.bandeira,'IDENTIFICADO','BASE_LOCAL_CC_BY_4',TRUE,
-           'Base brasileira CC BY 4.0; validar em caso de divergência',r.emissor,r.pais,r.tipo_cartao,NOW()
-      FROM catalogo_bins_referencia r
-     WHERE EXISTS (
-       SELECT 1 FROM catalogo_bins c WHERE c.bin=r.bin
-     )
-    ON CONFLICT (bin) DO UPDATE SET bandeira=EXCLUDED.bandeira,status='IDENTIFICADO',origem='BASE_LOCAL_CC_BY_4',
-      emissor=EXCLUDED.emissor,pais=EXCLUDED.pais,tipo_cartao=EXCLUDED.tipo_cartao,data_atualizacao=NOW()
-    WHERE catalogo_bins.status='PENDENTE' OR COALESCE(TRIM(catalogo_bins.bandeira),'')=''
-  `);
-  await db.$executeRawUnsafe(`
-    INSERT INTO conversoes (row_id,hash_linha,dados,data_criacao,data_atualizacao)
-    SELECT 'conv-bin-local-'||r.bin,'conv-bin-local-'||r.bin,
-      jsonb_build_object('id','conv-bin-local-'||r.bin,'tabela_origem','vendas_adquirentes','coluna_origem','bandeira',
-        'tipo_conversao','VALOR_EXATO','valor_original',r.bin,'valor_exibicao',r.bandeira,'adquirente_aplicacao','SIPAG',
-        'ativo',TRUE,'observacao','Criada pela base local brasileira de BINs (CC BY 4.0)',
-        'data_criacao',NOW()::text,'data_atualizacao',NOW()::text),NOW(),NOW()
-      FROM catalogo_bins_referencia r
-     WHERE EXISTS (
-       SELECT 1 FROM catalogo_bins b WHERE b.bin=r.bin
-     )
-       AND NOT EXISTS (
-         SELECT 1 FROM conversoes c WHERE c.dados->>'tabela_origem'='vendas_adquirentes'
-           AND c.dados->>'coluna_origem'='bandeira' AND TRIM(c.dados->>'valor_original')=r.bin
-           AND UPPER(COALESCE(c.dados->>'adquirente_aplicacao','')) IN ('','TODAS','SIPAG')
-       )
-    ON CONFLICT DO NOTHING
-  `);
-}
-
-export async function listarCatalogoBins(filtros: { status?: string; busca?: string; limite?: number; offset?: number } = {}) {
-  await garantirDb();
-  await sincronizarCatalogoBinsPostgres();
-  const db = await getDatabase();
-  const limite = Math.min(500, Math.max(1, Number(filtros.limite || 100)));
-  const offset = Math.max(0, Number(filtros.offset || 0));
-  const status = String(filtros.status || '').trim().toUpperCase();
-  const busca = String(filtros.busca || '').trim().toUpperCase();
-  const clausulas: string[] = ['c.ativo = TRUE'];
-  const parametros: unknown[] = [];
-  if (['IDENTIFICADO','PENDENTE'].includes(status)) { parametros.push(status); clausulas.push(`c.status = $${parametros.length}`); }
-  if (busca) { parametros.push(`%${busca}%`); clausulas.push(`(c.bin LIKE $${parametros.length} OR UPPER(COALESCE(c.bandeira,'')) LIKE $${parametros.length})`); }
-  const where = `WHERE ${clausulas.join(' AND ')}`;
-  const baseObservada = `
-    SELECT COALESCE(NULLIF(dados->>'bandeira_original',''), dados->>'bandeira') AS bin,
-           COUNT(*)::int AS quantidade_transacoes,
-           ARRAY_AGG(DISTINCT UPPER(COALESCE(dados->>'modalidade','')) ORDER BY UPPER(COALESCE(dados->>'modalidade',''))) AS modalidades
-      FROM vendas_adquirentes
-     WHERE UPPER(COALESCE(dados->>'adquirente','')) = 'SIPAG'
-       AND COALESCE(NULLIF(dados->>'bandeira_original',''), dados->>'bandeira') ~ '^[0-9]{6}$'
-     GROUP BY 1`;
-  const totalRows = await db.$queryRawUnsafe(`SELECT COUNT(*)::int total FROM catalogo_bins c ${where}`, ...parametros) as Array<{ total: number }>;
-  const resumoRows = await db.$queryRawUnsafe(`SELECT COUNT(*)::int total, COUNT(*) FILTER (WHERE status='IDENTIFICADO')::int identificados, COUNT(*) FILTER (WHERE status='PENDENTE')::int pendentes FROM catalogo_bins WHERE ativo=TRUE`) as Array<{total:number;identificados:number;pendentes:number}>;
-  const itens = await db.$queryRawUnsafe(
-    `SELECT c.bin,COALESCE(c.bandeira,'') bandeira,c.status,c.origem,c.ativo,c.observacao,
-            c.emissor,c.pais,c.tipo_cartao,c.consulta_online_status,c.consulta_online_em::text,c.consulta_online_erro,
-            COALESCE(o.quantidade_transacoes,0)::int quantidade_transacoes,COALESCE(o.modalidades,ARRAY[]::text[]) modalidades,
-            COALESCE(conv.dados->>'id','') conversao_id,c.data_atualizacao::text
-       FROM catalogo_bins c
-       LEFT JOIN (${baseObservada}) o ON o.bin=c.bin
-       LEFT JOIN LATERAL (
-         SELECT dados FROM conversoes
-          WHERE dados->>'tabela_origem'='vendas_adquirentes' AND dados->>'coluna_origem'='bandeira'
-            AND TRIM(dados->>'valor_original')=c.bin
-          ORDER BY CASE WHEN UPPER(COALESCE(dados->>'adquirente_aplicacao',''))='SIPAG' THEN 0 ELSE 1 END, pk DESC LIMIT 1
-       ) conv ON TRUE
-       ${where}
-       ORDER BY CASE c.status WHEN 'PENDENTE' THEN 0 ELSE 1 END, COALESCE(o.quantidade_transacoes,0) DESC, c.bin
-       LIMIT ${limite} OFFSET ${offset}`,
-    ...parametros,
-  ) as CatalogoBinItem[];
-  return { itens, total: Number(totalRows[0]?.total || 0), limite, offset, resumo: resumoRows[0] || { total: 0, identificados: 0, pendentes: 0 } };
-}
-
-export async function identificarBinCatalogo(binInput: string, dados: { bandeira?: string; observacao?: string }) {
-  await garantirDb();
-  const bin = String(binInput || '').replace(/\D/g, '');
-  const bandeira = String(dados.bandeira || '').trim().toUpperCase();
-  const observacao = String(dados.observacao || '').trim();
-  if (!/^\d{6}$/.test(bin)) throw new Error('Informe um BIN com exatamente seis dígitos.');
-  if (!bandeira) throw new Error('Informe o nome da bandeira.');
-
-  const regras = await listarConversoes();
-  const existente = regras.find((regra) => regra.ativo && regra.tabela_origem === 'vendas_adquirentes'
-    && regra.coluna_origem === 'bandeira' && String(regra.valor_original).trim() === bin
-    && ['', 'TODAS', 'SIPAG'].includes(String(regra.adquirente_aplicacao || '').trim().toUpperCase()));
-  const conversao = existente
-    ? await atualizarConversaoManual(existente.id, { valor_exibicao: bandeira, ativo: true })
-    : await criarConversaoManual({ tabela_origem: 'vendas_adquirentes', coluna_origem: 'bandeira', tipo_conversao: 'VALOR_EXATO', valor_original: bin, valor_exibicao: bandeira, adquirente_aplicacao: 'SIPAG', ativo: true, observacao: observacao || 'Criada pelo catálogo de BINs' });
-
-  const db = await getDatabase();
-  const linhas = await db.$queryRawUnsafe(
-    `INSERT INTO catalogo_bins (bin,bandeira,status,origem,ativo,observacao,data_criacao,data_atualizacao)
-     VALUES ($1,$2,'IDENTIFICADO','MANUAL',TRUE,$3,NOW(),NOW())
-     ON CONFLICT (bin) DO UPDATE SET bandeira=EXCLUDED.bandeira,status='IDENTIFICADO',origem='MANUAL',ativo=TRUE,observacao=EXCLUDED.observacao,data_atualizacao=NOW()
-     RETURNING *`, bin, bandeira, observacao,
-  ) as CatalogoBinItem[];
-  return { sucesso: true, item: linhas[0], conversao, mensagem: `BIN ${bin} identificado como ${bandeira}; conversão pronta para aplicação.` };
-}
-
-const BANDEIRAS_BIN_ONLINE: Record<string,string> = {
-  visa: 'VISA', mastercard: 'MASTERCARD', maestro: 'MASTERCARD', elo: 'ELO',
-  amex: 'AMEX', 'american express': 'AMEX', cabal: 'CABAL', diners: 'DINERS',
-  'diners club': 'DINERS', discover: 'DISCOVER', hipercard: 'HIPERCARD', jcb: 'JCB',
-};
-
-function bandeiraRespostaBinOnline(payload: Record<string, unknown>) {
-  const candidata = String(payload.scheme || payload.brand || '').trim().toLowerCase();
-  return BANDEIRAS_BIN_ONLINE[candidata] || (candidata ? candidata.toUpperCase() : '');
-}
-
-export async function identificarBinsPendentesOnline(limiteInput = 5) {
-  await garantirDb();
-  const limiteConfigurado = Math.max(1, Math.min(Number(process.env.BIN_LOOKUP_LIMIT_PER_RUN || 5), 50));
-  const limite = Math.max(1, Math.min(Number(limiteInput || limiteConfigurado), limiteConfigurado));
-  const base = String(process.env.BIN_LOOKUP_BASE_URL || 'https://lookup.binlist.net').replace(/\/$/, '');
-  if (!base.startsWith('https://')) throw new Error('BIN_LOOKUP_BASE_URL deve usar HTTPS.');
-  const db = await getDatabase();
-  await sincronizarCatalogoBinsPostgres();
-  const pendentes = await db.$queryRawUnsafe(
-    `SELECT bin FROM catalogo_bins WHERE ativo=TRUE AND status='PENDENTE'
-      AND COALESCE(consulta_online_status,'') <> 'NAO_ENCONTRADO'
-      ORDER BY COALESCE(consulta_online_em,'1970-01-01'::timestamptz),bin LIMIT $1`, limite,
-  ) as Array<{bin:string}>;
-  const resultados: Array<{bin:string;status:string;bandeira?:string;erro?:string}> = [];
-  for (const item of pendentes) {
-    try {
-      const headers: Record<string,string> = { 'Accept-Version': '3', Accept: 'application/json' };
-      if (process.env.BIN_LOOKUP_API_KEY) headers.Authorization = `Bearer ${process.env.BIN_LOOKUP_API_KEY}`;
-      const response = await fetch(`${base}/${item.bin}`, { headers, signal: AbortSignal.timeout(10000) });
-      if (response.status === 429) {
-        await db.$executeRawUnsafe(`UPDATE catalogo_bins SET consulta_online_status='LIMITE_ATINGIDO',consulta_online_em=NOW(),consulta_online_erro='Limite do provedor atingido',data_atualizacao=NOW() WHERE bin=$1`, item.bin);
-        resultados.push({ bin:item.bin,status:'LIMITE_ATINGIDO',erro:'Limite do provedor atingido' });
-        break;
-      }
-      if (response.status === 404) {
-        await db.$executeRawUnsafe(`UPDATE catalogo_bins SET consulta_online_status='NAO_ENCONTRADO',consulta_online_em=NOW(),consulta_online_erro='BIN não encontrado no provedor',data_atualizacao=NOW() WHERE bin=$1`, item.bin);
-        resultados.push({ bin:item.bin,status:'NAO_ENCONTRADO' });
-        continue;
-      }
-      if (!response.ok) throw new Error(`Provedor respondeu HTTP ${response.status}`);
-      const payload = await response.json() as Record<string, any>;
-      const bandeira = bandeiraRespostaBinOnline(payload);
-      if (!bandeira) throw new Error('Provedor não informou a bandeira');
-      await identificarBinCatalogo(item.bin, { bandeira, observacao: 'Identificado por consulta online; revise antes de aplicar as conversões.' });
-      await db.$executeRawUnsafe(
-        `UPDATE catalogo_bins SET origem='ONLINE',emissor=$2,pais=$3,tipo_cartao=$4,consulta_online_status='IDENTIFICADO',consulta_online_em=NOW(),consulta_online_erro='',data_atualizacao=NOW() WHERE bin=$1`,
-        item.bin,String(payload.bank?.name || ''),String(payload.country?.name || payload.country?.alpha2 || ''),String(payload.type || ''),
-      );
-      resultados.push({ bin:item.bin,status:'IDENTIFICADO',bandeira });
-    } catch (error) {
-      const mensagem = error instanceof Error ? error.message : String(error);
-      await db.$executeRawUnsafe(`UPDATE catalogo_bins SET consulta_online_status='ERRO',consulta_online_em=NOW(),consulta_online_erro=$2,data_atualizacao=NOW() WHERE bin=$1`, item.bin,mensagem.slice(0,500));
-      resultados.push({ bin:item.bin,status:'ERRO',erro:mensagem });
-    }
-  }
-  return { sucesso:true,consultados:resultados.length,identificados:resultados.filter((r)=>r.status==='IDENTIFICADO').length,resultados,provedor:'BINLIST' };
-}
-
 
 async function garantirAuditoriaOperacionalPostgres() {
   const db = await getDatabase();

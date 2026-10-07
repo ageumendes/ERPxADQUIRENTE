@@ -1,4 +1,5 @@
-import { Pool } from 'pg';
+import { preencherValorLiquidoErp } from './erp-valor-liquido.js';
+import { Pool, type PoolClient } from 'pg';
 import { tabelasSistema } from '../repositories/repositorio.js';
 import { conversoesSeed } from './conversoes-seed.js';
 import { getPool } from './pool.js';
@@ -46,8 +47,7 @@ async function ensureDatabaseExists(info: DatabaseUrlInfo) {
   }
 }
 
-async function ensureAppTables(_info: DatabaseUrlInfo) {
-  const pool = getPool();
+export async function aplicarSchemaBanco(pool: Pick<PoolClient, 'query'>) {
     await pool.query('CREATE SCHEMA IF NOT EXISTS public');
     await pool.query(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -58,7 +58,7 @@ async function ensureAppTables(_info: DatabaseUrlInfo) {
       )
     `);
 
-    await pool.query('DROP TABLE IF EXISTS "linhas_importadas"');
+    // Preserva todas as estruturas e dados legados.
 
     await pool.query(`CREATE TABLE IF NOT EXISTS usuarios (
       id UUID PRIMARY KEY, nome TEXT NOT NULL, login TEXT NOT NULL UNIQUE, perfil TEXT NOT NULL,
@@ -79,23 +79,9 @@ async function ensureAppTables(_info: DatabaseUrlInfo) {
       id UUID PRIMARY KEY, provider TEXT, sucesso BOOLEAN NOT NULL, resumo JSONB NOT NULL,
       criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`);
-    await pool.query(`CREATE TABLE IF NOT EXISTS catalogo_bins (
-      bin VARCHAR(6) PRIMARY KEY CHECK (bin ~ '^[0-9]{6}$'),
-      bandeira TEXT,
-      status TEXT NOT NULL DEFAULT 'PENDENTE' CHECK (status IN ('IDENTIFICADO','PENDENTE')),
-      origem TEXT NOT NULL DEFAULT 'IMPORTACAO',
-      ativo BOOLEAN NOT NULL DEFAULT TRUE,
-      observacao TEXT NOT NULL DEFAULT '',
-      data_criacao TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      data_atualizacao TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )`);
-    await pool.query(`CREATE INDEX IF NOT EXISTS idx_catalogo_bins_status ON catalogo_bins (status, bin)`);
-    await pool.query(`ALTER TABLE catalogo_bins ADD COLUMN IF NOT EXISTS emissor TEXT NOT NULL DEFAULT ''`);
-    await pool.query(`ALTER TABLE catalogo_bins ADD COLUMN IF NOT EXISTS pais TEXT NOT NULL DEFAULT ''`);
-    await pool.query(`ALTER TABLE catalogo_bins ADD COLUMN IF NOT EXISTS tipo_cartao TEXT NOT NULL DEFAULT ''`);
-    await pool.query(`ALTER TABLE catalogo_bins ADD COLUMN IF NOT EXISTS consulta_online_status TEXT NOT NULL DEFAULT ''`);
-    await pool.query(`ALTER TABLE catalogo_bins ADD COLUMN IF NOT EXISTS consulta_online_em TIMESTAMPTZ`);
-    await pool.query(`ALTER TABLE catalogo_bins ADD COLUMN IF NOT EXISTS consulta_online_erro TEXT NOT NULL DEFAULT ''`);
+    // Remoção solicitada: somente tabelas auxiliares de identificação de cartões.
+    await pool.query('DROP TABLE IF EXISTS catalogo_bins');
+    await pool.query('DROP TABLE IF EXISTS catalogo_bins_referencia');
     for (const tabelaSistema of tabelasSistema) {
       const tabela = quoteIdent(tabelaSistema.nome);
       await pool.query(`
@@ -390,12 +376,8 @@ async function ensureAppTables(_info: DatabaseUrlInfo) {
              AND c.documento IN ('27752608000129','27752608000200','99271133234')
         `);
 
-        // Remove apenas estruturas conhecidas de controle/totalização das tabelas de layout.
+        // Cabeçalhos/totalizadores originais permanecem nas tabelas brutas.
         const limpezas: number[] = [];
-        limpezas.push((await pool.query(`DELETE FROM vr_layout_16ap WHERE UPPER(COALESCE(dados->>'codigo_registro','')) IN ('H','T')`)).rowCount || 0);
-        limpezas.push((await pool.query(`DELETE FROM pluxee_layout WHERE UPPER(COALESCE(dados->>'codigo_registro','')) IN ('0','1','9')`)).rowCount || 0);
-        limpezas.push((await pool.query(`DELETE FROM alelo_layout WHERE UPPER(COALESCE(dados->>'codigo_registro','')) IN ('00','06','99')`)).rowCount || 0);
-        limpezas.push((await pool.query(`DELETE FROM convcard_layout_2_0_3_controle`)).rowCount || 0);
 
         const regrasMigradas = await pool.query(`
           UPDATE conversoes
@@ -473,31 +455,17 @@ async function ensureAppTables(_info: DatabaseUrlInfo) {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_vendas_adquirentes_relatorio_data_adquirente ON "vendas_adquirentes" ((CASE WHEN dados->>'data_venda' ~ '^\\d{4}-\\d{2}-\\d{2}' THEN LEFT(dados->>'data_venda', 10) WHEN dados->>'data_venda' ~ '^\\d{2}/\\d{2}/\\d{4}' THEN SUBSTRING(dados->>'data_venda', 7, 4) || '-' || SUBSTRING(dados->>'data_venda', 4, 2) || '-' || SUBSTRING(dados->>'data_venda', 1, 2) ELSE '' END), UPPER(COALESCE(dados->>'adquirente',''))) WHERE UPPER(COALESCE(dados->>'utilidade_status','UTIL')) <> 'NAO_UTIL'`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_vendas_adquirentes_status_transacao ON "vendas_adquirentes" (UPPER(COALESCE(dados->>'status_transacao','')))`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_vendas_adquirentes_duplicidade_status ON "vendas_adquirentes" (UPPER(COALESCE(dados->>'duplicidade_status','')))`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_erp_parcelas_sipag ON vendas_interdata(row_id)
+      WHERE COALESCE(dados->>'parcelas','') ~ '^[0-9]+[ ]*/[ ]*[0-9]+$'`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_erp_grupo_sipag ON vendas_interdata(row_id)
+      WHERE dados->>'origem_erp'='AGRUPAMENTO_PARCELAS_SIPAG'`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_erp_reserva_parcelas ON vendas_interdata((dados->>'agrupamento_erp_id'))`);
+    await preencherValorLiquidoErp(pool);
     // v0.1.193: o pós-processamento incremental localiza as linhas do lote por
     // importacao_id (ou pelo último lote que complementou uma linha histórica).
     for (const tabela of ['vendas_adquirentes', 'vendas_interdata']) {
       await pool.query(`CREATE INDEX IF NOT EXISTS idx_${tabela}_escopo_importacao ON "${tabela}" ((COALESCE(NULLIF(dados->>'ultima_importacao_id',''),dados->>'importacao_id','')))`);
     }
-    // Autorizações SIPAG antigas gravavam o BIN na coluna canônica bandeira.
-    // Preserva o BIN no JSON técnico e limpa somente valores estritamente
-    // numéricos de seis posições; bandeiras textuais e conversões ficam intactas.
-    await pool.query(`
-      UPDATE vendas_adquirentes
-         SET dados = jsonb_set(
-           jsonb_set(
-             dados,
-             '{dados_json}',
-             COALESCE(dados->'dados_json','{}'::jsonb) || jsonb_build_object('bin_cartao', dados->>'bandeira'),
-             TRUE
-           ),
-           '{bandeira}',
-           '""'::jsonb,
-           TRUE
-         ),
-         data_atualizacao = NOW()
-       WHERE dados->>'layout_origem' = 'sipag_extrato_transacoes_autorizadas'
-         AND COALESCE(dados->>'bandeira','') ~ '^[0-9]{6}$'
-    `);
     await pool.query(
       `INSERT INTO schema_migrations (versao, descricao)
        VALUES ($1, $2)
@@ -565,158 +533,8 @@ async function ensureAppTables(_info: DatabaseUrlInfo) {
       ['0.1.167', 'Quatro layouts de EXTRATOS SIPAG e código físico de estabelecimento nas vendas das adquirentes'],
     );
     await pool.query(
-      `INSERT INTO schema_migrations (versao, descricao)
-       VALUES ($1, $2)
-       ON CONFLICT (versao) DO NOTHING`,
-      ['0.1.168', 'Identificação da bandeira dos cartões nos extratos de autorizações SIPAG por BIN'],
-    );
-    await pool.query(
-      `INSERT INTO schema_migrations (versao, descricao)
-       VALUES ($1, $2)
-       ON CONFLICT (versao) DO NOTHING`,
-      ['0.1.169', 'BIN original gravado como bandeira SIPAG para tradução administrável por conversões'],
-    );
-    // v0.1.170: corrige autorizações SIPAG importadas antes de o BIN passar a
-    // alimentar a bandeira. O cartão mascarado sempre preserva os seis dígitos
-    // iniciais dentro de dados_json. Registros já preenchidos não são tocados.
-    await pool.query(`
-      WITH candidatos AS (
-        SELECT pk,
-               LEFT(REGEXP_REPLACE(
-                 COALESCE(dados->'dados_json'->>'Nº cartão', dados->>'Nº cartão', ''),
-                 '[^0-9]', '', 'g'
-               ), 6) AS bin
-          FROM vendas_adquirentes
-         WHERE UPPER(COALESCE(dados->>'adquirente', '')) = 'SIPAG'
-           AND UPPER(COALESCE(dados->>'tipo_arquivo', '')) = 'SIPAG_EXTRATO_TRANSACOES_AUTORIZADAS'
-           AND COALESCE(TRIM(dados->>'bandeira'), '') = ''
-      )
-      UPDATE vendas_adquirentes AS venda
-         SET dados = jsonb_set(
-                       jsonb_set(venda.dados, '{bandeira}', to_jsonb(candidato.bin::text), true),
-                       '{dados_json}',
-                       jsonb_set(
-                         jsonb_set(
-                           CASE WHEN jsonb_typeof(venda.dados->'dados_json') = 'object'
-                                THEN venda.dados->'dados_json' ELSE '{}'::jsonb END,
-                           '{bin_cartao}', to_jsonb(candidato.bin::text), true
-                         ),
-                         '{criterio_bandeira}', to_jsonb('BIN_CARTAO'::text), true
-                       ),
-                       true
-                     ),
-             data_atualizacao = NOW()
-        FROM candidatos AS candidato
-       WHERE venda.pk = candidato.pk
-         AND candidato.bin ~ '^[0-9]{6}$'
-    `);
-    await pool.query(
-      `INSERT INTO schema_migrations (versao, descricao)
-       VALUES ($1, $2)
-       ON CONFLICT (versao) DO NOTHING`,
-      ['0.1.170', 'Preenchimento retroativo do BIN em bandeiras vazias dos extratos de autorizações SIPAG'],
-    );
-    // v0.1.171: a conversão histórica de bandeira vazia para PIX já havia
-    // preenchido estes registros antes da v0.1.170. Autorizações de cartão
-    // (crédito, débito e voucher) recebem o BIN tanto no valor atual quanto no
-    // original, impedindo que a conversão incorreta seja reaplicada.
-    await pool.query(`
-      WITH candidatos AS (
-        SELECT pk,
-               LEFT(REGEXP_REPLACE(
-                 COALESCE(dados->'dados_json'->>'Nº cartão', dados->>'Nº cartão', ''),
-                 '[^0-9]', '', 'g'
-               ), 6) AS bin
-          FROM vendas_adquirentes
-         WHERE UPPER(COALESCE(dados->>'adquirente', '')) = 'SIPAG'
-           AND UPPER(COALESCE(dados->>'tipo_arquivo', '')) = 'SIPAG_EXTRATO_TRANSACOES_AUTORIZADAS'
-           AND UPPER(COALESCE(dados->>'modalidade', '')) IN ('CREDITO', 'DEBITO', 'VOUCHER')
-           AND UPPER(COALESCE(TRIM(dados->>'bandeira'), '')) IN ('', 'PIX')
-      )
-      UPDATE vendas_adquirentes AS venda
-         SET dados = jsonb_set(
-                       jsonb_set(
-                         jsonb_set(venda.dados, '{bandeira}', to_jsonb(candidato.bin::text), true),
-                         '{bandeira_original}', to_jsonb(candidato.bin::text), true
-                       ),
-                       '{dados_json}',
-                       jsonb_set(
-                         jsonb_set(
-                           CASE WHEN jsonb_typeof(venda.dados->'dados_json') = 'object'
-                                THEN venda.dados->'dados_json' ELSE '{}'::jsonb END,
-                           '{bin_cartao}', to_jsonb(candidato.bin::text), true
-                         ),
-                         '{criterio_bandeira}', to_jsonb('BIN_CARTAO_CORRECAO_RETROATIVA'::text), true
-                       ),
-                       true
-                     ),
-             data_atualizacao = NOW()
-        FROM candidatos AS candidato
-       WHERE venda.pk = candidato.pk
-         AND candidato.bin ~ '^[0-9]{6}$'
-    `);
-    await pool.query(
-      `INSERT INTO schema_migrations (versao, descricao)
-       VALUES ($1, $2)
-       ON CONFLICT (versao) DO NOTHING`,
-      ['0.1.171', 'Correção de bandeira PIX indevida para BIN nas autorizações SIPAG já importadas'],
-    );
-    // Importa o conhecimento já cadastrado pelo usuário e descobre BINs ainda
-    // não identificados nas vendas, sem substituir decisões existentes.
-    await pool.query(`
-      INSERT INTO catalogo_bins (bin,bandeira,status,origem,ativo,observacao,data_criacao,data_atualizacao)
-      SELECT TRIM(dados->>'valor_original'), UPPER(TRIM(dados->>'valor_exibicao')),
-             'IDENTIFICADO', 'CONVERSAO_EXISTENTE', TRUE,
-             'Migrado automaticamente da tabela conversoes', NOW(), NOW()
-        FROM conversoes
-       WHERE COALESCE((dados->>'ativo')::boolean, TRUE)
-         AND dados->>'tabela_origem' = 'vendas_adquirentes'
-         AND dados->>'coluna_origem' = 'bandeira'
-         AND TRIM(dados->>'valor_original') ~ '^[0-9]{6}$'
-         AND COALESCE(TRIM(dados->>'valor_exibicao'), '') <> ''
-      ON CONFLICT (bin) DO UPDATE
-        SET bandeira = COALESCE(NULLIF(catalogo_bins.bandeira,''), EXCLUDED.bandeira),
-            status = CASE WHEN COALESCE(NULLIF(catalogo_bins.bandeira,''), EXCLUDED.bandeira) IS NULL THEN 'PENDENTE' ELSE 'IDENTIFICADO' END,
-            data_atualizacao = NOW()
-    `);
-    await pool.query(`
-      INSERT INTO catalogo_bins (bin,status,origem)
-      SELECT DISTINCT COALESCE(NULLIF(dados->>'bandeira_original',''), dados->>'bandeira'),
-             'PENDENTE', 'IMPORTACAO'
-        FROM vendas_adquirentes
-       WHERE UPPER(COALESCE(dados->>'adquirente','')) = 'SIPAG'
-         AND COALESCE(NULLIF(dados->>'bandeira_original',''), dados->>'bandeira') ~ '^[0-9]{6}$'
-      ON CONFLICT (bin) DO NOTHING
-    `);
-    await pool.query(
-      `INSERT INTO schema_migrations (versao, descricao)
-       VALUES ($1, $2)
-       ON CONFLICT (versao) DO NOTHING`,
-      ['0.1.172', 'Catálogo de BINs, migração das conversões existentes e descoberta de BINs pendentes'],
-    );
-    await pool.query(
-      `INSERT INTO schema_migrations (versao, descricao) VALUES ($1, $2) ON CONFLICT (versao) DO NOTHING`,
-      ['0.1.173', 'Consulta online de BINs com cache e normalização auditável dos códigos de estabelecimento'],
-    );
-    await pool.query(
-      `INSERT INTO schema_migrations (versao, descricao) VALUES ($1, $2) ON CONFLICT (versao) DO NOTHING`,
-      ['0.1.174', 'Base local brasileira de BINs com fallback online apenas para códigos desconhecidos'],
-    );
-    await pool.query(
-      `INSERT INTO schema_migrations (versao, descricao) VALUES ($1, $2) ON CONFLICT (versao) DO NOTHING`,
-      ['0.1.175', 'Conversão de BINs aplicada também nas listagens e filtros PostgreSQL'],
-    );
-    await pool.query(
-      `INSERT INTO schema_migrations (versao, descricao) VALUES ($1, $2) ON CONFLICT (versao) DO NOTHING`,
-      ['0.1.176', 'Consulta automática periódica de BINs e extratos COOPCERTO de recebidas e a receber'],
-    );
-    await pool.query(
       `INSERT INTO schema_migrations (versao, descricao) VALUES ($1, $2) ON CONFLICT (versao) DO NOTHING`,
       ['0.1.177', 'Proteção do pool PostgreSQL e tratamento de indisponibilidade temporária no explorador de tabelas'],
-    );
-    await pool.query(
-      `INSERT INTO schema_migrations (versao, descricao) VALUES ($1, $2) ON CONFLICT (versao) DO NOTHING`,
-      ['0.1.178', 'Catálogo de BINs minimizado e aberto em painel sobreposto na tela de conversões'],
     );
     await pool.query(
       `INSERT INTO schema_migrations (versao, descricao) VALUES ($1, $2) ON CONFLICT (versao) DO NOTHING`,
@@ -963,6 +781,12 @@ async function ensureAppTables(_info: DatabaseUrlInfo) {
       WHERE UPPER(COALESCE(dados->>'adquirente',''))='COOPCERTO'
         AND UPPER(COALESCE(dados->>'utilidade_status','UTIL')) <> 'NAO_UTIL'
     `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_coopcerto_rrn_legado
+      ON vendas_adquirentes ((UPPER(TRIM(COALESCE(NULLIF(dados->'dados_json'->>'id_venda_rrn',''),NULLIF(dados->'dados_json'->>'ID Venda',''),dados->'dados_json'->>'id_venda','')))))
+      WHERE UPPER(COALESCE(dados->>'adquirente',''))='COOPCERTO'
+        AND UPPER(COALESCE(dados->>'utilidade_status','UTIL')) <> 'NAO_UTIL'
+    `);
     await pool.query(
       `INSERT INTO schema_migrations (versao, descricao) VALUES ($1, $2) ON CONFLICT (versao) DO NOTHING`,
       ['0.1.47', 'Remove tabela linhas_importadas e mantém somente resumo em importacoes'],
@@ -978,8 +802,15 @@ export async function bootstrapDatabase() {
   if (!info) return;
 
   try {
-    await ensureDatabaseExists(info);
-    await ensureAppTables(info);
+    if (process.env.NODE_ENV !== 'production' || process.env.DATABASE_AUTO_CREATE === 'true') await ensureDatabaseExists(info);
+    const client = await getPool().connect();
+    try {
+      await client.query('SELECT pg_advisory_lock(242, 2)');
+      await aplicarSchemaBanco(client);
+    } finally {
+      await client.query('SELECT pg_advisory_unlock(242, 2)').catch(() => undefined);
+      client.release();
+    }
     console.log(`[database] PostgreSQL pronto: ${info.databaseName}`);
   } catch (error) {
     const mensagem = error instanceof Error ? error.message : String(error);

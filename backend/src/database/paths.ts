@@ -5,7 +5,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 export const rootDir = path.resolve(__dirname, '../../..');
-export const storageDir = path.join(rootDir, 'storage');
+export const storageDir = process.env.STORAGE_DIR ? path.resolve(process.env.STORAGE_DIR) : path.join(rootDir, 'storage');
 export const importacoesDir = path.join(storageDir, 'importacoes');
 export const entradaDir = path.join(importacoesDir, 'entrada');
 export const processandoDir = path.join(importacoesDir, 'processando');

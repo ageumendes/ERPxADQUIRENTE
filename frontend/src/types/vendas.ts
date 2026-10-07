@@ -1,4 +1,11 @@
+export type RevisaoCoopcerto = {
+  status: string; motivos: string[]; detectada_em: string; importacao_id: string; hash_recebido: string;
+  anterior: Record<string, string>; recebido: Record<string, string>;
+};
+
 export type VendaErp = {
+  revisao_coopcerto?: RevisaoCoopcerto;
+  agrupamento_parcelas?: Array<{id:string;parcelas:string;valor_bruto:string;valor_liquido?:string}>;
   id: string;
   importacao_id: string;
   numero_linha: number;
@@ -8,6 +15,7 @@ export type VendaErp = {
   terminal?: string;
   nsu?: string;
   valor_bruto?: string;
+  valor_liquido?: string;
   forma_pagamento?: string;
   forma_pagamento_original?: string;
   bandeira?: string;
@@ -31,6 +39,9 @@ export type VendaErp = {
 };
 
 export type VendaAdquirente = {
+  revisao_coopcerto?: RevisaoCoopcerto;
+  pix_vinculo_conflito?: string;
+  pix_redundante?: string;
   id: string;
   importacao_id: string;
   adquirente: string;

@@ -18,12 +18,14 @@ export type Importacao = {
   mensagem_erro?: string | null;
   data_importacao: string;
   data_atualizacao: string;
+  pos_processamento_pendente?: boolean;
 };
 
 type LinhaImportacao = { dados: Importacao };
 
 const statusPendentes = [
   'RECEBIDO',
+  'ENFILEIRADO',
   'CLASSIFICANDO',
   'PROCESSANDO',
   'PROCESSANDO_FILA',
@@ -92,16 +94,23 @@ export async function buscarImportacaoPendentePorHash(hash: string): Promise<Imp
 }
 
 export async function atualizarImportacao(id: string, data: Partial<Importacao>): Promise<Importacao | undefined> {
-  const pool = getPool();
-  const atual = await pool.query<LinhaImportacao>(`SELECT dados FROM "importacoes" WHERE row_id = $1 LIMIT 1`, [id]);
-  if (!atual.rows[0]) return undefined;
+  const patch = { ...data, data_atualizacao: new Date().toISOString() };
+  const result = await getPool().query<LinhaImportacao>(
+    `UPDATE importacoes SET dados=dados || $2::jsonb,
+       hash_arquivo=CASE WHEN $2::jsonb ? 'hash_arquivo' THEN $2::jsonb->>'hash_arquivo' ELSE hash_arquivo END,
+       data_atualizacao=NOW() WHERE row_id=$1 RETURNING dados`, [id, serializarJsonb(patch)]);
+  return result.rows[0]?.dados;
+}
 
-  const atualizada = { ...atual.rows[0].dados, ...data, data_atualizacao: new Date().toISOString() };
-  await pool.query(
-    `UPDATE "importacoes" SET dados = $2::jsonb, hash_linha = $3, hash_arquivo = $4, data_atualizacao = NOW() WHERE row_id = $1`,
-    [id, serializarJsonb(atualizada), (atualizada as Importacao & { hash_linha?: string }).hash_linha || null, atualizada.hash_arquivo || null],
-  );
-  return atualizada;
+export async function listarPosProcessamentoPendente(): Promise<Importacao[]> {
+  const result = await getPool().query<LinhaImportacao>(`SELECT dados FROM importacoes
+    WHERE dados->>'status_importacao'='PROCESSADO' AND dados->>'pos_processamento_pendente'='true' ORDER BY pk`);
+  return result.rows.map(r=>r.dados);
+}
+export async function concluirPosProcessamento(ids: string[]) {
+  if (!ids.length) return;
+  await getPool().query(`UPDATE importacoes SET dados=dados || '{"pos_processamento_pendente":false}'::jsonb,
+    data_atualizacao=NOW() WHERE row_id=ANY($1::text[])`, [ids]);
 }
 
 export async function resumoImportacoes() {
