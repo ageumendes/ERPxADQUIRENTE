@@ -1,3 +1,4 @@
+import { planejarLotesSemanais, deslocarData } from '../services/periodo-conciliacao.js';
 import { sincronizarAgrupamentosSipagTx, validarAgrupamentoSipagTx, atualizarParcelasGrupoTx } from '../services/erp-parcelas-sipag.js';
 import { sincronizarVinculosPixSipagSicoobTx, validarElegibilidadeConciliacao, validarParConciliacao, PIX_FINANCEIRO_SQL } from '../services/pix-vinculos.js';
 import { ehSipagComplementar, planejarSipagComplementares, sipagChaveComplementar, sipagData } from '../services/sipag-complementacao.js';
@@ -3821,14 +3822,17 @@ const sqlFonteErpAgrupamento = (alias:string) => sqlRegistroNaoAplicavel('vendas
 const sqlFonteAdqAgrupamento = (alias:string) => sqlRegistroNaoAplicavel('vendas_adquirentes',alias);
 let agrupamentoEmCurso: Promise<unknown> | null = null;
 let ultimoAgrupamento = 0;
-export async function sincronizarParcelasErpSipag(forcar = false) {
+export async function sincronizarParcelasErpSipag(forcar = false, escopo: {dataInicial?:string;dataFinal?:string} = {}) {
   if (!usarPostgres()) return;
-  if (agrupamentoEmCurso) return agrupamentoEmCurso;
-  if (!forcar && Date.now()-ultimoAgrupamento<2000) return;
+  if (agrupamentoEmCurso) {
+    await agrupamentoEmCurso;
+    return sincronizarParcelasErpSipag(forcar, escopo);
+  }
+  if (!forcar && !escopo.dataInicial && !escopo.dataFinal && Date.now()-ultimoAgrupamento<2000) return;
   agrupamentoEmCurso=(async()=>{
     const inicio=Date.now();
     await garantirDbPostgres();const db=await getDatabase();
-    const r=await db.$transaction(tx=>sincronizarAgrupamentosSipagTx(tx,sqlFonteErpAgrupamento,sqlFonteAdqAgrupamento));
+    const r=await db.$transaction(tx=>sincronizarAgrupamentosSipagTx(tx,sqlFonteErpAgrupamento,sqlFonteAdqAgrupamento,escopo));
     ultimoAgrupamento=Date.now();
     console.log(`[agrupamento-sipag] concluído ${ultimoAgrupamento-inicio}ms criados=${r.criados}`);
     return r;
@@ -4095,6 +4099,9 @@ type OpcoesConciliacaoHibrida = {
   dataInicial?: string;
   dataFinal?: string;
   adquirentes?: string[];
+  protegerFronteiras?: boolean;
+  numeroLote?: number;
+  totalLotes?: number;
 };
 
 type ParAvaliado = { adq: VendaCandidata; erp: VendaCandidata; avaliacao: NonNullable<ReturnType<typeof avaliarCandidatoHibrido>> };
@@ -4110,14 +4117,19 @@ async function executarConciliacaoHibridaPostgres(opcoes: OpcoesConciliacaoHibri
   const ambiguidadesLiberadas = opcoes.simular
     ? { vendas_adquirentes_liberadas:0, vendas_interdata_liberadas:0 }
     : await liberarAmbiguidadesParaReavaliacaoPostgres({ dataInicial: opcoes.dataInicial, dataFinal: opcoes.dataFinal });
-  const filtros: string[] = [`e.conciliacao_id IS NULL`, `COALESCE(NULLIF(e.dados->>'status_conciliacao',''),'PENDENTE') = 'PENDENTE'`, `UPPER(COALESCE(e.dados->>'duplicidade_status','')) <> 'DUPLICADO_PROVAVEL'`, `NOT (${sqlRegistroNaoAplicavel('vendas_interdata','e')})`];
+  const filtros: string[] = [opcoes.protegerFronteiras ? `(e.conciliacao_id IS NULL OR EXISTS (SELECT 1 FROM conciliacoes cx WHERE cx.row_id=e.conciliacao_id AND cx.status='AMBIGUO'))` : `e.conciliacao_id IS NULL`, opcoes.protegerFronteiras ? `COALESCE(NULLIF(e.dados->>'status_conciliacao',''),'PENDENTE') IN ('PENDENTE','AMBIGUO')` : `COALESCE(NULLIF(e.dados->>'status_conciliacao',''),'PENDENTE') = 'PENDENTE'`, `UPPER(COALESCE(e.dados->>'duplicidade_status','')) <> 'DUPLICADO_PROVAVEL'`, `NOT (${sqlRegistroNaoAplicavel('vendas_interdata','e')})`];
   const parametros: unknown[] = [];
-  if (opcoes.dataInicial) { parametros.push(opcoes.dataInicial); filtros.push(`${sqlDataNormalizada('e')} >= $${parametros.length}`); }
-  if (opcoes.dataFinal) { parametros.push(opcoes.dataFinal); filtros.push(`${sqlDataNormalizada('e')} <= $${parametros.length}`); }
+  if (opcoes.dataInicial) { parametros.push(opcoes.protegerFronteiras ? deslocarData(opcoes.dataInicial,-2) : opcoes.dataInicial); filtros.push(`${sqlDataNormalizada('e')} >= $${parametros.length}`); }
+  if (opcoes.dataFinal) { parametros.push(opcoes.protegerFronteiras ? deslocarData(opcoes.dataFinal,2) : opcoes.dataFinal); filtros.push(`${sqlDataNormalizada('e')} <= $${parametros.length}`); }
   let ultimoPk = 0;
   const pares: ParAvaliado[] = [];
   const erpIdsAvaliados: string[] = [];
   let erpsAvaliados = 0;
+  const idsDoPeriodo = new Set<string>();
+  const noPeriodo=(dados:Record<string,unknown>)=>{
+    const data=chaveDataIsoVenda(String(dados.data_venda||''));
+    return (!opcoes.dataInicial||data>=opcoes.dataInicial)&&(!opcoes.dataFinal||data<=opcoes.dataFinal);
+  };
 
   while (true) {
     const paramsLote = [...parametros, ultimoPk, tamanhoLote];
@@ -4128,16 +4140,29 @@ async function executarConciliacaoHibridaPostgres(opcoes: OpcoesConciliacaoHibri
       ...paramsLote,
     ) as Array<{ pk: string; id: string; dados: Record<string, unknown> }>;
     if (lote.length === 0) break;
-    erpsAvaliados += lote.length;
+    const lotePrincipal=lote.filter(item=>!opcoes.protegerFronteiras||noPeriodo(item.dados));
+    erpsAvaliados += lotePrincipal.length;
+    lotePrincipal.forEach(item=>idsDoPeriodo.add(item.id));
     ultimoPk = Number(lote[lote.length - 1].pk);
     const ids = lote.map((item) => item.id);
-    erpIdsAvaliados.push(...ids);
+    erpIdsAvaliados.push(...lotePrincipal.map(item=>item.id));
     const adquirentes = (opcoes.adquirentes || []).map((item) => String(item).toUpperCase());
+    const inicioCandidatos = Date.now();
     const candidatos = await db.$queryRawUnsafe(
-      `SELECT a.row_id AS adq_id, a.dados AS adq_dados, e.row_id AS erp_id, e.dados AS erp_dados
-       FROM "vendas_interdata" e
-       JOIN "vendas_adquirentes" a
-        ON a.conciliacao_id IS NULL
+      `WITH erp_lote AS MATERIALIZED (
+         SELECT e.row_id, e.dados, ${sqlDataNormalizada('e')} AS data_chave,
+                ${sqlValorCentavos('e')} AS valor_centavos, e.estabelecimento_chave
+         FROM vendas_interdata e WHERE e.row_id = ANY($1::text[])
+           AND ${sqlDataNormalizada('e')} <> '' AND ${sqlCodigoEstabelecimento('vendas_interdata','e')} <> ''
+       ), adquirentes_elegiveis AS MATERIALIZED (
+         SELECT a.row_id, a.dados, ${sqlDataNormalizada('a')} AS data_chave,
+                ${sqlValorCentavos('a')} AS valor_centavos, a.estabelecimento_chave
+         FROM vendas_adquirentes a
+        WHERE a.conciliacao_id IS NULL
+        AND a.estabelecimento_chave IN (SELECT estabelecimento_chave FROM erp_lote)
+        AND a.data_venda_filtro BETWEEN
+            ((SELECT MIN(data_chave)::date FROM erp_lote) - 1)::text AND
+            ((SELECT MAX(data_chave)::date FROM erp_lote) + 1)::text
         AND NOT (${sqlRegistroNaoAplicavel('vendas_adquirentes','a')})
         AND UPPER(COALESCE(a.dados->>'utilidade_status','UTIL')) <> 'NAO_UTIL'
         AND LOWER(COALESCE(a.dados->>'suprimido_por_vinculo_voucher','false')) <> 'true'
@@ -4147,19 +4172,21 @@ async function executarConciliacaoHibridaPostgres(opcoes: OpcoesConciliacaoHibri
         AND COALESCE(a.dados->>'pix_vinculo_conflito','') = ''
         AND UPPER(TRIM(COALESCE(a.dados->>'status_transacao',''))) = 'AUTORIZADO'
         AND COALESCE(a.dados->'revisao_coopcerto'->>'status','') <> 'PENDENTE'
-        AND ${sqlDataNormalizada('a')} <> '' AND ${sqlDataNormalizada('e')} <> ''
-        AND ABS((${sqlDataNormalizada('a')})::date - (${sqlDataNormalizada('e')})::date) <= 1
-        AND ${sqlValorCentavos('a')} = ${sqlValorCentavos('e')}
         AND ${sqlCodigoEstabelecimento('vendas_adquirentes','a')} <> ''
-        AND ${sqlCodigoEstabelecimento('vendas_interdata','e')} <> ''
-        AND ${sqlCodigoEstabelecimento('vendas_adquirentes','a')} = ${sqlCodigoEstabelecimento('vendas_interdata','e')}
-       WHERE e.row_id = ANY($1::text[])
-         AND ($2::text[] = '{}'::text[] OR EXISTS (
+        AND ${sqlDataNormalizada('a')} <> ''
+        AND ($2::text[] = '{}'::text[] OR EXISTS (
            SELECT 1 FROM UNNEST($2::text[]) AS filtro(nome)
            WHERE UPPER(COALESCE(a.dados->>'adquirente','')) LIKE '%' || filtro.nome || '%'
-         ))`,
+         ))
+       )
+       SELECT a.row_id AS adq_id, a.dados AS adq_dados, e.row_id AS erp_id, e.dados AS erp_dados
+       FROM erp_lote e JOIN adquirentes_elegiveis a
+         ON ${sqlCodigoEstabelecimento('vendas_adquirentes','a')} = ${sqlCodigoEstabelecimento('vendas_interdata','e')}
+        AND a.valor_centavos = e.valor_centavos
+        AND ABS(a.data_chave::date - e.data_chave::date) <= 1`,
       ids, adquirentes,
     ) as Array<{ adq_id: string; adq_dados: Record<string, unknown>; erp_id: string; erp_dados: Record<string, unknown> }>;
+    console.log(`[conciliacao:candidatos] ERP=${lote.length} pares=${candidatos.length} tempo_ms=${Date.now()-inicioCandidatos}`);
     for (const linha of candidatos) {
       const adq = { ...linha.adq_dados, id: linha.adq_id } as VendaCandidata;
       const erp = { ...linha.erp_dados, id: linha.erp_id } as VendaCandidata;
@@ -4209,6 +4236,9 @@ async function executarConciliacaoHibridaPostgres(opcoes: OpcoesConciliacaoHibri
   const ordenados = [...pares].sort(compararPrioridade);
 
   for (const par of ordenados) {
+    if (opcoes.protegerFronteiras && !idsDoPeriodo.has(par.erp.id)) continue;
+    // Um candidato da semana vizinha é contexto, nunca pode ser consumido pelo lote.
+    if (opcoes.protegerFronteiras && pares.some(outro=>outro.adq.id===par.adq.id&&!idsDoPeriodo.has(outro.erp.id))) continue;
     if (opcoes.confirmarAutomatico === false || par.avaliacao.score < 80) continue;
     if (usadosErp.has(par.erp.id) || usadosAdq.has(par.adq.id)) continue;
 
@@ -4258,6 +4288,7 @@ async function executarConciliacaoHibridaPostgres(opcoes: OpcoesConciliacaoHibri
   const unicosRestantes: ParAvaliado[] = [];
   const paresAmbiguos: ParAvaliado[] = [];
   for (const par of restantes) {
+    if(opcoes.protegerFronteiras&&!idsDoPeriodo.has(par.erp.id))continue;
     if ((porErpRestante.get(par.erp.id)?.length || 0) === 1 && (porAdqRestante.get(par.adq.id)?.length || 0) === 1) unicosRestantes.push(par);
     else paresAmbiguos.push(par);
   }
@@ -4330,7 +4361,7 @@ async function executarConciliacaoHibridaPostgres(opcoes: OpcoesConciliacaoHibri
   let saneamentoAmbiguidades = { desfeitas: 0, invalidas_regra_atual: 0, vinculo_consumido: 0 };
   if (!opcoes.simular) {
     await criarConciliacoesPostgres(candidatos);
-    saneamentoAmbiguidades = await sanearAmbiguidadesPostgres(pares, erpIdsAvaliados);
+    saneamentoAmbiguidades = await sanearAmbiguidadesPostgres(opcoes.protegerFronteiras?pares.filter(p=>idsDoPeriodo.has(p.erp.id)):pares, erpIdsAvaliados);
     metricasAmbiguidades = await criarAmbiguidadesPostgres(candidatosAmbiguos);
   }
   return {
@@ -4510,17 +4541,47 @@ async function promoverSugestoesAltaConfiancaPostgres(scoreMinimo = 80, escopo: 
   return promovidas;
 }
 
-export async function executarConciliacaoAutomatica(opcoes: (OpcoesConciliacaoHibrida & { limiteCandidatos?: number }) = {}) {
+async function executarConciliacaoAutomaticaLote(opcoes: (OpcoesConciliacaoHibrida & { limiteCandidatos?: number }) = {}) {
   if (usarPostgres()) {
-    if (!opcoes.simular) await sincronizarParcelasErpSipag(true);
+    if (!opcoes.simular) await sincronizarParcelasErpSipag(true, opcoes);
     const resultado = await executarConciliacaoHibridaPostgres(opcoes);
-    if (!opcoes.simular && opcoes.confirmarAutomatico !== false) {
+    if (!opcoes.simular && opcoes.confirmarAutomatico !== false && !opcoes.protegerFronteiras) {
       const promovidas = await promoverSugestoesAltaConfiancaPostgres(80, { dataInicial: opcoes.dataInicial, dataFinal: opcoes.dataFinal });
       return { ...resultado, promovidas_alta_confianca: promovidas, conciliados: Number((resultado as any).conciliados || 0) + promovidas };
     }
     return resultado;
   }
   return executarConciliacaoAutomaticaLegada({ confirmarAutomatico: opcoes.confirmarAutomatico, limiteCandidatos: opcoes.limiteCandidatos || 20000 });
+}
+
+export async function executarConciliacaoAutomatica(opcoes: (OpcoesConciliacaoHibrida & { limiteCandidatos?: number }) = {}): Promise<any> {
+  if(!opcoes.dataInicial||!opcoes.dataFinal)return executarConciliacaoAutomaticaLote(opcoes);
+  const lotes=planejarLotesSemanais(opcoes.dataInicial,opcoes.dataFinal);
+  let total:any=null;
+  const resultados:any[]=[];
+  for(let i=0;i<lotes.length;i++){
+    const periodo=lotes[i];const inicio=Date.now();
+    console.log(`[conciliacao:lote] iniciando lote=${opcoes.numeroLote||i+1}/${opcoes.totalLotes||lotes.length} ERP=${periodo.dataInicial} a ${periodo.dataFinal}`);
+    try {
+      const resultado:any=await executarConciliacaoAutomaticaLote({...opcoes,...periodo,protegerFronteiras:true});
+      resultados.push({...periodo,conciliados:resultado.conciliados||0,tempo_ms:Date.now()-inicio});
+      if(!total)total={...resultado};
+      else {
+        for (const [chave, quantidade] of Object.entries(resultado)) {
+          if (typeof quantidade === 'number') total[chave] = Number(total[chave] || 0) + quantidade;
+        }
+        for (const [chave, quantidade] of Object.entries(resultado.por_classificacao || {})) {
+          total.por_classificacao = { ...total.por_classificacao, [chave]: Number(total.por_classificacao?.[chave] || 0) + Number(quantidade) };
+        }
+        total.avaliados={vendas_interdata:Number(total.avaliados?.vendas_interdata||0)+Number(resultado.avaliados?.vendas_interdata||0),pares_candidatos:Number(total.avaliados?.pares_candidatos||0)+Number(resultado.avaliados?.pares_candidatos||0)};
+      }
+      console.log(`[conciliacao:lote] concluído lote=${opcoes.numeroLote||i+1}/${opcoes.totalLotes||lotes.length} ERP=${periodo.dataInicial} a ${periodo.dataFinal} conciliados=${resultado.conciliados||0} tempo_ms=${Date.now()-inicio}`);
+    } catch(erro){
+      console.error(`[conciliacao:lote] falhou lote=${opcoes.numeroLote||i+1}/${opcoes.totalLotes||lotes.length} ERP=${periodo.dataInicial} a ${periodo.dataFinal}`);
+      throw erro;
+    }
+  }
+  return {...total,lotes:resultados,periodo:{dataInicial:opcoes.dataInicial,dataFinal:opcoes.dataFinal}};
 }
 
 

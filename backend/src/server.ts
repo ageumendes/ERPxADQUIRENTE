@@ -1,3 +1,4 @@
+import { periodoUltimosSeteDias } from './services/periodo-conciliacao.js';
 import { bloquearNaoAplicaNaSaida } from './http/bloqueio-nao-aplica.js';
 import './config/env.js';
 import { validarConfiguracaoProducao } from './config/producao.js';
@@ -405,7 +406,8 @@ async function executarConsolidacaoVoucherComLock(origem: 'automatica' | 'manual
   return consolidacaoVoucherRodando;
 }
 
-async function acionarConciliacaoAutomaticaAposImportacao(escopo: { dataInicial?: string; dataFinal?: string } = {}): Promise<void> {
+async function acionarConciliacaoAutomaticaAposImportacao(): Promise<void> {
+  const escopo = periodoUltimosSeteDias();
   conciliacaoAutomaticaPendente = true;
   if (conciliacaoAutomaticaRodando) {
     console.log('[conciliacao-automatica] execução já em andamento; nova passagem agendada.');
@@ -435,7 +437,10 @@ async function acionarConciliacaoAutomaticaAposImportacao(escopo: { dataInicial?
       console.log(`[conciliacao-automatica] concluída: ${JSON.stringify(resultado)}`);
     }
   })()
-    .catch((error) => logErroImportacao('conciliacao-automatica-pos-importacao', error))
+    .catch((error) => {
+      logErroImportacao('conciliacao-automatica-pos-importacao', error);
+      throw error;
+    })
     .finally(() => {
       conciliacaoAutomaticaRodando = null;
     });
@@ -624,9 +629,9 @@ async function executarPosProcessamentoImportacoesSeNecessario(): Promise<void> 
       const dataInicial = resultadoConversoes.escopo_periodo.data_inicial;
       const dataFinal = resultadoConversoes.escopo_periodo.data_final;
       if (dataInicial && dataFinal) {
-        console.log(`[pos-importacao] conversões concluídas; pipeline incremental no período ${dataInicial} a ${dataFinal}.`);
+        console.log(`[pos-importacao] conversões concluídas; conciliação nos últimos 7 dias pela data atual de La Paz.`);
         etapaPosProcessamentoImportacao = 'conciliacao';
-        await acionarConciliacaoAutomaticaAposImportacao({ dataInicial, dataFinal });
+        await acionarConciliacaoAutomaticaAposImportacao();
       } else {
         console.log('[pos-importacao] lote sem vendas conciliáveis; consolidação e conciliação dispensadas.');
       }
@@ -641,7 +646,7 @@ async function executarPosProcessamentoImportacoesSeNecessario(): Promise<void> 
   })().finally(() => {
     etapaPosProcessamentoImportacao = '';
     posProcessamentoImportacaoRodando = null;
-    console.log(`[fila-importacao] pos_processamento_finalizado=true tempo_ms=${Date.now() - inicio}`);
+    console.log(`[fila-importacao] pos_processamento_finalizado=true sucesso=${posProcessamentoConcluido} tempo_ms=${Date.now() - inicio}`);
 
     // Se arquivos chegaram enquanto as conversões estavam em andamento, eles
     // ficaram apenas enfileirados. Retoma o worker automaticamente ao liberar o lock.
@@ -1457,7 +1462,7 @@ app.use((error: Error, _req: Request, res: Response, _next: NextFunction) => {
 
 // Recupera agrupamentos históricos sem bloquear as consultas HTTP de leitura.
 inicializacaoSipag.status = 'EM_ANDAMENTO';
-const agrupamentoInicial = sincronizarParcelasErpSipag(true).then(() => {
+const agrupamentoInicial = sincronizarParcelasErpSipag(true, periodoUltimosSeteDias()).then(() => {
   inicializacaoSipag.status = 'CONCLUIDA';
   inicializacaoSipag.concluida_em = new Date().toISOString();
 }).catch(error => {

@@ -1,5 +1,4 @@
 import '../dist/config/env.js';
-import { urlPostgresParaCliente } from '../dist/config/database-url.js';
 import { APP_VERSION } from '../dist/version.js';
 import { Pool } from 'pg';
 import { mkdir, cp, copyFile, stat, chmod, writeFile } from 'node:fs/promises';
@@ -20,7 +19,13 @@ const destination=path.resolve(process.argv[2] || '/var/backups/erpxadquirente',
 await mkdir(destination,{recursive:true,mode:0o700});
 const dump=path.join(destination,'database.dump');
 // Preserva sslmode/opções da URL sem publicar a senha nos argumentos do processo.
-const env={...process.env,PGDATABASE:urlPostgresParaCliente(process.env.DATABASE_URL)};
+const env={...process.env,PGHOST:url.hostname,PGPORT:url.port||'5432',PGUSER:decodeURIComponent(url.username),PGPASSWORD:decodeURIComponent(url.password),PGDATABASE:decodeURIComponent(url.pathname.slice(1)),PGCONNECT_TIMEOUT:'10'};
+const opcoesCliente={sslmode:'PGSSLMODE',sslrootcert:'PGSSLROOTCERT',sslcert:'PGSSLCERT',sslkey:'PGSSLKEY',sslcrl:'PGSSLCRL',options:'PGOPTIONS',application_name:'PGAPPNAME',connect_timeout:'PGCONNECT_TIMEOUT'};
+for(const [chave,valor] of url.searchParams){
+  if(chave==='schema')continue;
+  if(!(chave in opcoesCliente))throw new Error('Opção PostgreSQL não suportada pelo backup: '+chave);
+  env[opcoesCliente[chave]]=valor;
+}
 await new Promise((resolve,reject)=>{
   const child=spawn('pg_dump',['--format=custom','--file',dump],{env,stdio:['ignore','ignore','pipe']});
   child.stderr.resume();

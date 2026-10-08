@@ -75,7 +75,7 @@ export function planejarAgrupamentosSipag(erps:Registro[], adquirentes:Registro[
   const contagens=new Map<string,number>();for(const p of planos)contagens.set(p.adquirente_id,(contagens.get(p.adquirente_id)||0)+1);
   return planos.filter(p=>contagens.get(p.adquirente_id)===1);
 }
-async function lerFontes(tx:Tx, sqlErp:SqlNaoAplica, sqlAdq:SqlNaoAplica,nsu?:string) {
+async function lerFontes(tx:Tx, sqlErp:SqlNaoAplica, sqlAdq:SqlNaoAplica,nsu?:string,escopo:{dataInicial?:string;dataFinal?:string}={}) {
   // Na confirmação, carrega também vendas concorrentes com o mesmo NSU,
   // preservando a detecção de ambiguidade sem reprocessar todo o histórico.
   const filtro=(alias:string)=> {
@@ -83,29 +83,39 @@ async function lerFontes(tx:Tx, sqlErp:SqlNaoAplica, sqlAdq:SqlNaoAplica,nsu?:st
     return nsu===undefined?'':` AND (CASE WHEN ${limpo} ~ '^[0-9]+$' THEN COALESCE(NULLIF(LTRIM(${limpo},'0'),''),'0') ELSE ${limpo} END)=$1`;
   };
   const args=nsu===undefined?[]:[nsu];
-  const erps=await tx.$queryRawUnsafe(`SELECT e.row_id,e.conciliacao_id,e.dados,${sqlErp('e')} AS nao_aplica FROM vendas_interdata e WHERE COALESCE(e.dados->>'parcelas','') ~ '^[0-9]+[ ]*/[ ]*[0-9]+$'${filtro('e')}`, ...args);
-  const adqs=await tx.$queryRawUnsafe(`SELECT a.row_id,a.conciliacao_id,a.dados,${sqlAdq('a')} AS nao_aplica FROM vendas_adquirentes a WHERE UPPER(COALESCE(a.dados->>'adquirente',''))='SIPAG'${filtro('a')}`, ...args);
+  const periodo=(alias:string, margem=false)=> {
+    if(!escopo.dataInicial||!escopo.dataFinal)return '';
+    return margem ? ` AND ${alias}.data_venda_filtro BETWEEN ($${args.length+1}::date-1)::text AND ($${args.length+2}::date+1)::text` : ` AND ${alias}.data_venda_filtro BETWEEN $${args.length+1}::text AND $${args.length+2}::text`;
+  };
+  const argsPeriodo=escopo.dataInicial&&escopo.dataFinal?[...args,escopo.dataInicial,escopo.dataFinal]:args;
+  const erps=await tx.$queryRawUnsafe(`SELECT e.row_id,e.conciliacao_id,e.dados,${sqlErp('e')} AS nao_aplica FROM vendas_interdata e WHERE COALESCE(e.dados->>'parcelas','') ~ '^[0-9]+[ ]*/[ ]*[0-9]+$'${filtro('e')}${periodo('e')}`, ...argsPeriodo);
+  const adqs=await tx.$queryRawUnsafe(`SELECT a.row_id,a.conciliacao_id,a.dados,${sqlAdq('a')} AS nao_aplica FROM vendas_adquirentes a WHERE UPPER(COALESCE(a.dados->>'adquirente',''))='SIPAG'${filtro('a')}${periodo('a',true)}`, ...argsPeriodo);
   const adaptar=(r:any)=>({...r.dados,id:r.row_id,conciliacao_id:r.conciliacao_id,_nao_aplica:r.nao_aplica});
   return {erps:erps.map(adaptar),adqs:adqs.map(adaptar)};
 }
-export async function sincronizarAgrupamentosSipagTx(tx:Tx,sqlErp:SqlNaoAplica,sqlAdq:SqlNaoAplica) {
+export async function sincronizarAgrupamentosSipagTx(tx:Tx,sqlErp:SqlNaoAplica,sqlAdq:SqlNaoAplica,escopo:{dataInicial?:string;dataFinal?:string}={}) {
   await tx.$executeRawUnsafe('SELECT pg_advisory_xact_lock(247,1)');
-  const fontes=await lerFontes(tx,sqlErp,sqlAdq);const planos=planejarAgrupamentosSipag(fontes.erps,fontes.adqs);
-  const existentes=await tx.$queryRawUnsafe(`SELECT row_id,conciliacao_id,dados FROM vendas_interdata WHERE dados->>'origem_erp'=$1 ORDER BY row_id FOR UPDATE`,ORIGEM_GRUPO_SIPAG);
+  const fontes=await lerFontes(tx,sqlErp,sqlAdq,undefined,escopo);const planos=planejarAgrupamentosSipag(fontes.erps,fontes.adqs);
+  const existentes=await tx.$queryRawUnsafe(`SELECT row_id,conciliacao_id,dados FROM vendas_interdata WHERE dados->>'origem_erp'=$1 AND ($2::text IS NULL OR data_venda_filtro >= $2) AND ($3::text IS NULL OR data_venda_filtro <= $3) ORDER BY row_id FOR UPDATE`,ORIGEM_GRUPO_SIPAG,escopo.dataInicial||null,escopo.dataFinal||null);
   const planosIds=new Set(planos.map(p=>p.id));
   const adqsPorId=new Map<string,Registro>(fontes.adqs.map((a:Registro)=>[a.id,a]));
   const mapa=new Map<string,any>(existentes.map((r:any)=>[r.row_id,r]));
-  for(const r of existentes) {
-    if(r.conciliacao_id||planosIds.has(r.row_id))continue;
-    await tx.$executeRawUnsafe(`UPDATE vendas_interdata SET dados=dados||'{"agrupamento_inativo":true}'::jsonb WHERE row_id=$1 AND COALESCE(dados->>'agrupamento_inativo','false')<>'true'`,r.row_id);
-    await tx.$executeRawUnsafe(`UPDATE vendas_interdata SET dados=dados-'agrupamento_erp_id'-'conciliacao_agrupamento_id'-'status_agrupamento' WHERE dados->>'agrupamento_erp_id'=$1`,r.row_id);
+  // Limpeza em lote: grupos já inativos não provocam duas consultas por grupo.
+  const obsoletos=existentes.filter((r:any)=>!r.conciliacao_id&&!planosIds.has(r.row_id)).map((r:any)=>r.row_id);
+  if(obsoletos.length){
+    await tx.$executeRawUnsafe(`UPDATE vendas_interdata SET dados=dados||'{"agrupamento_inativo":true}'::jsonb WHERE row_id=ANY($1::text[]) AND COALESCE(dados->>'agrupamento_inativo','false')<>'true'`,obsoletos);
+    await tx.$executeRawUnsafe(`UPDATE vendas_interdata SET dados=dados-'agrupamento_erp_id'-'conciliacao_agrupamento_id'-'status_agrupamento' WHERE dados->>'agrupamento_erp_id'=ANY($1::text[])`,obsoletos);
   }
+  // Reserva as parcelas em uma consulta, mantendo a revalidação sob lock.
+  const todosIds=[...new Set(planos.flatMap(p=>p.itens.map(v=>v.id)))];
+  const parcelasBloqueadas=todosIds.length ? await tx.$queryRawUnsafe(`SELECT row_id,conciliacao_id,dados FROM vendas_interdata WHERE row_id=ANY($1::text[]) ORDER BY row_id FOR UPDATE`,todosIds) : [];
+  const parcelasPorId=new Map<string,any>(parcelasBloqueadas.map((r:any)=>[r.row_id,r]));
   let criados=0;
   for(const p of planos) {
     const existente=mapa.get(p.id);if(existente?.conciliacao_id)continue;
     if(adqsPorId.get(p.adquirente_id)?.conciliacao_id)continue;
     const ids=p.itens.map(v=>v.id);
-    const atuais=await tx.$queryRawUnsafe(`SELECT row_id,conciliacao_id,dados FROM vendas_interdata WHERE row_id=ANY($1::text[]) ORDER BY row_id FOR UPDATE`,ids);
+    const atuais=ids.map(id=>parcelasPorId.get(id)).filter(Boolean);
     if(atuais.length!==ids.length||atuais.some((r:any)=>r.conciliacao_id||assinatura({...r.dados,id:r.row_id})!==assinatura(p.itens.find(v=>v.id===r.row_id)!)))continue;
     if(existente) {
       p.dados.data_criacao=existente.dados.data_criacao;

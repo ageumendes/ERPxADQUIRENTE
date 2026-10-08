@@ -1,6 +1,6 @@
 {
   "name": "erpxadquirente-backend",
-  "version": "0.1.251",
+  "version": "0.1.254",
   "type": "module",
   "scripts": {
     "dev": "tsx src/server.ts",

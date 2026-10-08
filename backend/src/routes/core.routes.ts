@@ -1,3 +1,4 @@
+import { resolverPeriodoConciliacao } from '../services/periodo-conciliacao.js';
 import type { Express } from 'express';
 import {
   listarImportacoes,
@@ -584,32 +585,34 @@ export function registerCoreRoutes(app: Express, deps: CoreRoutesDeps) {
     try {
       const confirmarAutomatico = req.body && typeof req.body === 'object' && 'confirmarAutomatico' in req.body ? Boolean((req.body as any).confirmarAutomatico) : true;
       const corpo = (req.body && typeof req.body === 'object' ? req.body : {}) as any;
+      const periodo = resolverPeriodoConciliacao(corpo.dataInicial, corpo.dataFinal);
       res.json(await executarComAtividadeSegundoPlano('conciliacao', () => executarConciliacaoAutomatica({
         confirmarAutomatico,
         incluirProvaveis: Boolean(corpo.incluirProvaveis),
         tamanhoLote: Math.max(100, Math.min(Number(corpo.tamanhoLote || 500), 2000)),
-        dataInicial: corpo.dataInicial,
-        dataFinal: corpo.dataFinal,
+        ...periodo,
+        numeroLote: Number.isSafeInteger(corpo.numeroLote)&&corpo.numeroLote>0?corpo.numeroLote:undefined,
+        totalLotes: Number.isSafeInteger(corpo.totalLotes)&&corpo.totalLotes>0?corpo.totalLotes:undefined,
         adquirentes: Array.isArray(corpo.adquirentes) ? corpo.adquirentes : undefined,
       })));
     } catch (error) {
-      res.status(500).json({ sucesso: false, mensagem: error instanceof Error ? error.message : 'Erro ao executar conciliação automática.' });
+      res.status(error instanceof Error && /datas inicial|data inicial/.test(error.message) ? 400 : 500).json({ sucesso: false, mensagem: error instanceof Error ? error.message : 'Erro ao executar conciliação automática.' });
     }
   });
 
   app.post('/api/conciliacoes/automaticas/simular', async (req, res) => {
     try {
       const corpo = (req.body && typeof req.body === 'object' ? req.body : {}) as any;
+      const periodo = resolverPeriodoConciliacao(corpo.dataInicial, corpo.dataFinal);
       res.json(await executarComAtividadeSegundoPlano('conciliacao', () => executarConciliacaoAutomatica({
         confirmarAutomatico: false,
         simular: true,
         tamanhoLote: Math.max(100, Math.min(Number(corpo.tamanhoLote || 500), 2000)),
-        dataInicial: corpo.dataInicial,
-        dataFinal: corpo.dataFinal,
+        ...periodo,
         adquirentes: Array.isArray(corpo.adquirentes) ? corpo.adquirentes : undefined,
       })));
     } catch (error) {
-      res.status(500).json({ sucesso: false, mensagem: error instanceof Error ? error.message : 'Erro ao simular conciliação automática.' });
+      res.status(error instanceof Error && /datas inicial|data inicial/.test(error.message) ? 400 : 500).json({ sucesso: false, mensagem: error instanceof Error ? error.message : 'Erro ao simular conciliação automática.' });
     }
   });
 

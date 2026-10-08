@@ -34,7 +34,11 @@ test('SQL real: agrupamento idempotente, totais únicos, automático, desfazer, 
     const originais=erps.map(v=>({...v,importacao_id:'orig',hash_linha:v.id,dados_originais:{'Vlr. Parcela':v.valor_bruto,'Vlr. Liquido':v.valor_liquido}}));
     for(const e of originais)await query('INSERT INTO vendas_interdata(row_id,hash_linha,dados) VALUES($1,$1,$2::jsonb)',[e.id,JSON.stringify(e)]);
     await query('INSERT INTO vendas_adquirentes(row_id,hash_linha,dados) VALUES($1,$1,$2::jsonb)',[adq.id,JSON.stringify({...adq,nsu:'00500327',hash_linha:adq.id})]);
-    await repo.sincronizarParcelasErpSipag(true);
+    await repo.sincronizarParcelasErpSipag(true,{dataInicial:'2026-10-02',dataFinal:'2026-10-08'});
+    assert.equal((await query("SELECT row_id FROM vendas_interdata WHERE dados->>'origem_erp'='AGRUPAMENTO_PARCELAS_SIPAG'")).rows.length,0,'parcelas anteriores ao período não são agrupadas');
+    await repo.sincronizarParcelasErpSipag(true,{dataInicial:'2026-10-01',dataFinal:'2026-10-01'});
+    await repo.sincronizarParcelasErpSipag(true,{dataInicial:'2026-10-02',dataFinal:'2026-10-08'});
+    assert.equal((await query("SELECT row_id FROM vendas_interdata WHERE dados->>'origem_erp'='AGRUPAMENTO_PARCELAS_SIPAG' AND COALESCE(dados->>'agrupamento_inativo','false')='false'")).rows.length,1,'execução de outro período preserva grupos históricos');
     const antesRepetir=consultas.length;
     await repo.sincronizarParcelasErpSipag(true);
     assert.ok(!consultas.slice(antesRepetir).some(sql=>/^UPDATE vendas_interdata SET dados/.test(sql)),'sincronização intacta não deve regravar parcelas/grupo');

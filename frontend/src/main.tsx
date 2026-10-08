@@ -1,3 +1,4 @@
+import { planejarLotesConciliacao } from './lib/lotes-conciliacao';
 import { ParcelasErp } from './components/ParcelasErp';
 import { SftpFilesDialog } from './components/SftpFilesDialog';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
@@ -1152,6 +1153,13 @@ function ConciliacoesPage() {
   const [acaoModal, setAcaoModal] = useState<{acao:'confirmar'|'desfazer';ids:string[]}|null>(null);
   const [motivo, setMotivo] = useState('');
   const [manualAberta, setManualAberta] = useState(false);
+  const [periodoAberto, setPeriodoAberto] = useState(false);
+  const [periodoInicial, setPeriodoInicial] = useState('');
+  const [periodoFinal, setPeriodoFinal] = useState('');
+  const historicoRef=useRef<{lotes:{dataInicial:string;dataFinal:string}[];indice:number;conciliados:number;sugeridos:number;ambiguos:number}|null>(null);
+  const cancelarHistoricoRef=useRef(false);
+  const [progressoHistorico,setProgressoHistorico]=useState('');
+  const [historicoPausado,setHistoricoPausado]=useState(false);
   const [manualErp, setManualErp] = useState<VendaErp[]>([]);
   const [manualAdq, setManualAdq] = useState<VendaAdquirente[]>([]);
   const [manualTotalErp, setManualTotalErp] = useState(0);
@@ -1338,27 +1346,33 @@ function ConciliacoesPage() {
     }
   }
 
-  async function executarConciliacao() {
-    setLoading(true);
-    setMessage('');
+  async function executarConciliacao(periodo?: {dataInicial:string;dataFinal:string}, retomar=false) {
+    setLoading(true);setMessage('');setHistoricoPausado(false);cancelarHistoricoRef.current=false;
+    if(periodo&&!retomar)historicoRef.current={lotes:planejarLotesConciliacao(periodo.dataInicial,periodo.dataFinal),indice:0,conciliados:0,sugeridos:0,ambiguos:0};
+    if(!periodo&&!retomar){historicoRef.current=null;setProgressoHistorico('');}
+    const historico=historicoRef.current;
     try {
-      const response = await apiFetch(`${API_URL}/api/conciliacoes/automaticas/executar`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ confirmarAutomatico: true, incluirProvaveis: false, tamanhoLote: 500 }),
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data?.mensagem || 'Erro ao executar conciliação automática.');
-      setMessage(`Conciliação executada: ${data.conciliados || 0} conciliado(s), ${data.sugeridos || 0} sugestão(ões), ${data.ambiguos || 0} ambíguo(s) atual(is) e ${data.ambiguidades_saneadas || 0} ambiguidade(s) histórica(s) saneada(s).`);
-      await Promise.all([
-        carregar(0, status, true),
-        status === 'PENDENTE' && manualAberta ? carregarManual(manualBuscaErp, manualBuscaAdq, 0, 0) : Promise.resolve(),
-      ]);
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'Erro ao executar conciliação automática.');
-    } finally {
-      setLoading(false);
-    }
+      do {
+        const lote=historico?.lotes[historico.indice];
+        if(historico)setProgressoHistorico(`Lote ${historico.indice+1}/${historico.lotes.length}: ${lote!.dataInicial} a ${lote!.dataFinal}. Conciliados nesta execução: ${historico.conciliados}.`);
+        const response=await apiFetch(`${API_URL}/api/conciliacoes/automaticas/executar`,{
+          method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({confirmarAutomatico:true,incluirProvaveis:false,tamanhoLote:500,...lote,numeroLote:historico?historico.indice+1:undefined,totalLotes:historico?.lotes.length}),
+        });
+        const data=await response.json();
+        if(!response.ok)throw new Error(data?.mensagem||'Erro ao executar conciliação automática.');
+        if(historico){
+          historico.conciliados+=Number(data.conciliados||0);historico.sugeridos+=Number(data.sugeridos||0);historico.ambiguos+=Number(data.ambiguos||0);historico.indice++;
+          setProgressoHistorico(`Lotes concluídos: ${historico.indice}/${historico.lotes.length}. Conciliados nesta execução: ${historico.conciliados}.`);
+          if(cancelarHistoricoRef.current&&historico.indice<historico.lotes.length){setHistoricoPausado(true);setMessage('Execução pausada após concluir o lote atual. Você pode retomar o próximo lote nesta tela.');break;}
+          if(historico.indice===historico.lotes.length)setMessage(`Período concluído: ${historico.conciliados} conciliado(s), ${historico.sugeridos} sugestão(ões) e ${historico.ambiguos} ocorrência(s) de ambiguidade nos lotes.`);
+        }else setMessage(`Conciliação dos últimos 7 dias: ${data.conciliados||0} conciliado(s), ${data.sugeridos||0} sugestão(ões) e ${data.ambiguos||0} ambíguo(s).`);
+      }while(historico&&historico.indice<historico.lotes.length);
+      await Promise.all([carregar(0,status,true),status==='PENDENTE'&&manualAberta?carregarManual(manualBuscaErp,manualBuscaAdq,0,0):Promise.resolve()]);
+    }catch(error){
+      if(historico&&historico.indice<historico.lotes.length)setHistoricoPausado(true);
+      setMessage(error instanceof Error?error.message:'Erro ao executar conciliação automática.');
+    }finally{setLoading(false);}
   }
 
   async function simularConciliacao() {
@@ -1783,10 +1797,11 @@ function ConciliacoesPage() {
           <p className="muted">Acompanhe o que já foi conciliado e revise somente o que precisa de atenção.</p>
         </div>
         <div className="conciliacao-top-actions">
-          <button onClick={executarConciliacao} disabled={loading}>{loading ? 'Processando...' : 'Executar conciliação automática'}</button>
+          <button onClick={()=>executarConciliacao()} title="Analisa hoje e os seis dias anteriores, pela data da venda ERP" disabled={loading}>{loading ? 'Processando...' : 'Executar conciliação automática'}</button>
           <details className="conciliacao-actions-menu">
-            <summary>Outras ações <ChevronDown size={15}/></summary>
+            <summary>Outras opções <ChevronDown size={15}/></summary>
             <div className="conciliacao-actions-popover">
+              <button className="secondary" onClick={()=>setPeriodoAberto(true)} disabled={loading}><strong>Conciliar por período</strong><span>Escolha as datas inicial e final das vendas ERP.</span></button>
               <button className="secondary" onClick={simularConciliacao} disabled={loading}><strong>Simular conciliação</strong><span>Analisa possíveis correspondências sem alterar dados.</span></button>
               <button className="secondary" onClick={abrirConciliacaoManual} disabled={loading}><strong>Conciliação manual</strong><span>Abre as duas filas em modo de tela cheia.</span></button>
             </div>
@@ -1794,6 +1809,23 @@ function ConciliacoesPage() {
         </div>
       </div>
       {message && <p className="message">{message}</p>}
+      {progressoHistorico&&<div className="message" role="status"><p>{progressoHistorico}</p>
+        {loading&&!historicoPausado&&<button className="secondary" onClick={()=>{cancelarHistoricoRef.current=true;setProgressoHistorico(atual=>atual+' Pausa solicitada após o lote atual.');}}>Pausar após o lote atual</button>}
+        {historicoPausado&&<button disabled={loading} onClick={()=>void executarConciliacao(undefined,true)}>Retomar lote pendente</button>}
+        <small>Mantenha esta tela aberta durante a execução histórica. A retomada fica disponível nesta tela.</small>
+      </div>}
+
+      {periodoAberto && <div className="modal-backdrop" onKeyDown={e=>{if(e.key==='Escape'&&!loading)setPeriodoAberto(false)}}>
+        <div className="conciliacao-modal acao" role="dialog" aria-modal="true" aria-labelledby="titulo-periodo">
+          <h2 id="titulo-periodo">Conciliar por período</h2>
+          <p>Inclui vendas ERP entre as duas datas, inclusive. O botão principal analisa hoje e os seis dias anteriores, no fuso de La Paz.</p>
+          <label htmlFor="periodo-inicial">Data inicial</label><input id="periodo-inicial" type="date" autoFocus value={periodoInicial} onChange={e=>setPeriodoInicial(e.target.value)}/>
+          <label htmlFor="periodo-final">Data final</label><input id="periodo-final" type="date" value={periodoFinal} min={periodoInicial||undefined} onChange={e=>setPeriodoFinal(e.target.value)}/>
+          {periodoInicial&&periodoFinal&&periodoInicial>periodoFinal&&<p role="alert">A data inicial deve ser menor ou igual à data final.</p>}
+          <div className="button-row"><button className="secondary" disabled={loading} onClick={()=>setPeriodoAberto(false)}>Cancelar</button><button disabled={loading||!periodoInicial||!periodoFinal||periodoInicial>periodoFinal} onClick={()=>{setPeriodoAberto(false);void executarConciliacao({dataInicial:periodoInicial,dataFinal:periodoFinal})}}>Executar no período</button></div>
+        </div>
+      </div>}
+
 
       <div className="conciliacao-control-bar">
         <div className="conciliacao-kpis">

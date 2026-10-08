@@ -1,6 +1,6 @@
 {
   "name": "erpxadquirente-frontend",
-  "version": "0.1.251",
+  "version": "0.1.254",
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
